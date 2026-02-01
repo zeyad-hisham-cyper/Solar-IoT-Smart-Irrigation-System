@@ -21,7 +21,6 @@
 #include "esp_adc/adc_cali.h"
 #include "hal/adc_types.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,7 +64,7 @@ typedef struct {
     adc_unit_t adc_unit;                      /**< [INPUT] ADC Unit to use (e.g., ADC_UNIT_1) */
     adc_channel_t adc_channel;                /**< [INPUT] ADC Channel connected to sensor */
     adc_atten_t adc_attenuation;              /**< [INPUT] ADC Attenuation (recommended ADC_ATTEN_DB_11/12) */
-    adc_bits_width_t adc_bitwidth;            /**< [INPUT] ADC Bit width (recommended ADC_BITWIDTH_12) */
+    adc_bitwidth_t adc_bitwidth;            /**< [INPUT] ADC Bit width (recommended ADC_BITWIDTH_12) */
     adc_cali_handle_t adc_cali_handle;        /**< [OUTPUT] Handle for ADC calibration scheme */
     gpio_num_t power_gpio;                    /**< [INPUT] GPIO to power the sensor (GPIO_NUM_NC if unused) */
     gpio_num_t calibration_button_gpio;       /**< [INPUT] GPIO for user calibration button */

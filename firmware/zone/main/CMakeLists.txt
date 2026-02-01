@@ -2,6 +2,9 @@ idf_component_register(
     SRCS
         "main.c"
         "HAL/soil_moisture/src/soil_moisture.c"
+        "HAL/ds18b20/src/temp_ds18b20.c"
     INCLUDE_DIRS
-        "include" "HAL/soil_moisture/include"
+        "include" 
+        "HAL/soil_moisture/include"
+        "HAL/ds18b20/include"
 )

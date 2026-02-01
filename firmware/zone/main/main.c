@@ -7,6 +7,7 @@
 
 #include "app_config.h"
 #include "soil_moisture.h"
+#include "temp_ds18b20.h"
 
 static const char *TAG = "TEST_APP";
 
@@ -45,7 +46,21 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "Driver Initialized.");
 
-    /* 3. Offer Calibration (Optional - Wait 5s to skip) */
+    /* 3. Initialize DS18B20 (Temperature) */
+    ESP_LOGI(TAG, "Initializing DS18B20...");
+    Temp_DS18B20_Config_t temp_config = {
+        .data_gpio = DS18B20_DATA_GPIO,
+        .enable_internal_pullup = DS18B20_INTERNAL_PULLUP, // Note: External 4.7k recommended
+        .max_retries = DS18B20_MAX_RETRIES,
+        .resolution = (Temp_DS18B20_Resolution_t)DS18B20_RESOLUTION_BITS
+    };
+    
+    /* We don't abort if temp fails, just log warning */
+    if (Temp_DS18B20_Init(&temp_config) != ESP_OK) {
+        ESP_LOGW(TAG, "DS18B20 not detected or init failed.");
+    }
+
+    /* 4. Offer Calibration (Optional - Wait 5s to skip) */
     ESP_LOGI(TAG, "If you want to CALIBRATE, press the button (GPIO %d) now.", soil_config.calibration_button_gpio);
     ESP_LOGI(TAG, "Waiting 5 seconds...");
     vTaskDelay(pdMS_TO_TICKS(5000));
@@ -62,22 +77,36 @@ void app_main(void)
         ESP_LOGI(TAG, "No button press. Skipping Calibration, using stored values.");
     }
 
-    /* 4. Reading Loop */
+    /* 5. Reading Loop */
     ESP_LOGI(TAG, "Entering Reading Loop...");
-    Soil_Moisture_Readings_t readings;
+    Soil_Moisture_Readings_t soil_readings;
+    Temp_DS18B20_Readings_t temp_readings;
 
     while (1) {
-        ret = Soil_Moisture_Read(&soil_config, &readings);
+        /* Read Soil */
+        ret = Soil_Moisture_Read(&soil_config, &soil_readings);
+        
+        /* Read Temp */
+        (void)Temp_DS18B20_Read(&temp_config, &temp_readings);
+
         if (ret == ESP_OK) {
             const char* state_str = "UNKNOWN";
-            switch(readings.state) {
+            switch(soil_readings.state) {
                 case SOIL_STATE_DRY: state_str = "DRY"; break;
                 case SOIL_STATE_NORMAL: state_str = "NORMAL"; break;
                 case SOIL_STATE_WET: state_str = "WET"; break;
             }
 
-            ESP_LOGI(TAG, "Moisture: %3d%% | ADC: %4d | State: %s", 
-                     readings.moisture_percentage, readings.adc_reading, state_str);
+            char temp_str[16] = "--.-";
+            if (temp_readings.valid) {
+                snprintf(temp_str, sizeof(temp_str), "%.1f", temp_readings.temperature_c);
+            }
+
+            ESP_LOGI(TAG, "Moisture: %3d%% | Temp: %s C | ADC: %4d | State: %s", 
+                     soil_readings.moisture_percentage, 
+                     temp_str,
+                     soil_readings.adc_reading, 
+                     state_str);
         } else {
             ESP_LOGE(TAG, "Read Failed: %s", esp_err_to_name(ret));
         }

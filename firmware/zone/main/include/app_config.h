@@ -22,4 +22,16 @@
 #define SOIL_ADC_ATTEN          ADC_ATTEN_DB_12
 #define SOIL_ADC_BITWIDTH       ADC_BITWIDTH_12
 
+
+
+/* ========================================================================== */
+/*                          DS18B20 CONFIGURATION                             */
+/* ========================================================================== */
+
+#define DS18B20_DATA_GPIO          GPIO_NUM_18
+#define DS18B20_INTERNAL_PULLUP    1
+#define DS18B20_MAX_RETRIES        3
+#define DS18B20_RESOLUTION_BITS    12
+
+
 #endif // APP_CONFIG_H
