@@ -204,14 +204,14 @@ esp_err_t Soil_Moisture_Init(Soil_Moisture_Config_t *config)
     /* Configure Button if valid */
     if ((config->calibration_button_gpio >= 0) && (config->calibration_button_gpio != GPIO_NUM_NC))
     {
-        gpio_config_t button_io_conf = {
+        gpio_config_t button_io_cfg = {
             .pin_bit_mask = (1ULL << (uint32_t)config->calibration_button_gpio),
             .mode = GPIO_MODE_INPUT,
             .pull_up_en = GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE
         };
-        ret = gpio_config(&button_io_conf);
+        ret = gpio_config(&button_io_cfg);
         if (ret != ESP_OK)
         {
             return ret;

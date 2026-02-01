@@ -15,7 +15,7 @@
 #define SOIL_CALIBRATION_BUTTON GPIO_NUM_0      /* Button for user calibration (e.g., Boot Button) */
 
 /* Sensor Behavior */
-#define SOIL_READ_DELAY_MS      10              /* Stabilization delay after powering sensor */
+#define SOIL_READ_DELAY_MS      100              /* Stabilization delay after powering sensor */
 #define SOIL_ADC_SAMPLES        64              /* Number of samples for averaging (Noise Reduction) */
 
 /* ADC Settings (Defaults) */
