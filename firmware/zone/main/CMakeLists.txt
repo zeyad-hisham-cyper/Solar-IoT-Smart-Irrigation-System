@@ -7,4 +7,10 @@ idf_component_register(
         "include" 
         "HAL/soil_moisture/include"
         "HAL/ds18b20/include"
+    REQUIRES
+        esp_now
+        driver
+        esp_adc
+        nvs_flash
+        esp_hw_support
 )

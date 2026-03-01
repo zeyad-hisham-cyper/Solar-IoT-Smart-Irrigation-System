@@ -1,0 +1,226 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    // ─── ZONE ───────────────────────────────────────────────
+    {
+      "label": "Zone: Full Clean",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py fullclean",
+      "options": {
+        "cwd": "${workspaceFolder}/zone",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Zone: Build",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py build",
+      "options": {
+        "cwd": "${workspaceFolder}/zone",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": "$gcc"
+    },
+
+    // ✅ NEW: Zone erase tasks
+    {
+      "label": "Zone: Erase Flash",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py -p ${input:zoneMonitorPort} erase-flash",
+      "options": {
+        "cwd": "${workspaceFolder}/zone",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Zone: Erase Flash All",
+      "type": "shell",
+      // Enter ports comma-separated, no spaces e.g: COM3,COM5,COM7
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && FOR %p IN (${input:zonePorts}) DO (echo Erasing Zone flash on %p... && idf.py -p %p erase-flash)",
+      "options": {
+        "cwd": "${workspaceFolder}/zone",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Zone: Flash All",
+      "type": "shell",
+      // Enter ports comma-separated, no spaces e.g: COM3,COM5,COM7
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && FOR %p IN (${input:zonePorts}) DO (echo Flashing Zone on %p... && idf.py -p %p flash)",
+      "options": {
+        "cwd": "${workspaceFolder}/zone",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Zone: Monitor",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py -p ${input:zoneMonitorPort} monitor",
+      "options": {
+        "cwd": "${workspaceFolder}/zone",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+
+    // ✅ NEW: Zone combined flows with erase
+    {
+      "label": "Zone: Build → Erase Flash All → Flash All",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Zone: Build", "Zone: Erase Flash All", "Zone: Flash All"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Zone: Build → Erase Flash All → Flash All → Monitor",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Zone: Build", "Zone: Erase Flash All", "Zone: Flash All", "Zone: Monitor"],
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Zone: Build → Flash All → Monitor",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Zone: Build", "Zone: Flash All", "Zone: Monitor"],
+      "problemMatcher": []
+    },
+
+    // ─── CONTROL ────────────────────────────────────────────
+    {
+      "label": "Control: Full Clean",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py fullclean",
+      "options": {
+        "cwd": "${workspaceFolder}/control",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Control: Build",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py build",
+      "options": {
+        "cwd": "${workspaceFolder}/control",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "group": "build",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": "$gcc"
+    },
+
+    // ✅ NEW: Control erase task
+    {
+      "label": "Control: Erase Flash",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py -p ${input:controlPort} erase-flash",
+      "options": {
+        "cwd": "${workspaceFolder}/control",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Control: Flash",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py -p ${input:controlPort} flash",
+      "options": {
+        "cwd": "${workspaceFolder}/control",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Control: Monitor",
+      "type": "shell",
+      "command": "C:\\Users\\zeyad\\esp\\v5.5.2\\esp-idf\\export.bat && idf.py -p ${input:controlPort} monitor",
+      "options": {
+        "cwd": "${workspaceFolder}/control",
+        "shell": { "executable": "cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+
+    // ✅ NEW: Control combined flows with erase
+    {
+      "label": "Control: Build → Erase Flash → Flash",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Control: Build", "Control: Erase Flash", "Control: Flash"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Control: Build → Erase Flash → Flash → Monitor",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Control: Build", "Control: Erase Flash", "Control: Flash", "Control: Monitor"],
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Control: Build → Flash → Monitor",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Control: Build", "Control: Flash", "Control: Monitor"],
+      "problemMatcher": []
+    },
+
+    // ─── BOTH ───────────────────────────────────────────────
+    {
+      "label": "Full Clean All",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Zone: Full Clean", "Control: Full Clean"],
+      "problemMatcher": []
+    },
+
+    // ✅ NEW: Erase both (safe as sequence)
+    {
+      "label": "Erase Flash All",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Zone: Erase Flash All", "Control: Erase Flash"],
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Build All",
+      "dependsOrder": "parallel",
+      "dependsOn": ["Zone: Build", "Control: Build"],
+      "group": "build",
+      "problemMatcher": []
+    }
+  ],
+
+  "inputs": [
+    {
+      "id": "zonePorts",
+      "type": "promptString",
+      "description": "Zone serial ports — comma separated, no spaces (e.g. COM3,COM5,COM7)",
+      "default": "COM3"
+    },
+    {
+      "id": "zoneMonitorPort",
+      "type": "promptString",
+      "description": "Which Zone port to monitor (one only)",
+      "default": "COM3"
+    },
+    {
+      "id": "controlPort",
+      "type": "promptString",
+      "description": "Control serial port (flash + monitor)",
+      "default": "COM4"
+    }
+  ]
+}

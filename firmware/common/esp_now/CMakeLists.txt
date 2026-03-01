@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/esp_now_driver.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_wifi
+        nvs_flash
+        esp_hw_support
+)
