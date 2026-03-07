@@ -3,14 +3,19 @@ idf_component_register(
         "main.c"
         "HAL/soil_moisture/src/soil_moisture.c"
         "HAL/ds18b20/src/temp_ds18b20.c"
+        "HAL/valve/src/valve.c"
+        "HAL/FlowMeter/src/flow_meter.c"
     INCLUDE_DIRS
         "include" 
         "HAL/soil_moisture/include"
         "HAL/ds18b20/include"
+        "HAL/valve/include"
+        "HAL/FlowMeter/include"
     REQUIRES
         esp_now
         driver
         esp_adc
+        esp_timer
         nvs_flash
         esp_hw_support
 )

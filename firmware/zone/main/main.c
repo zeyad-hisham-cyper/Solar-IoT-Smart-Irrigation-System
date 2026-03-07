@@ -27,13 +27,24 @@
 #include "nvs.h"
 #include "esp_mac.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 
 #include "app_config.h"
 #include "soil_moisture.h"
 #include "temp_ds18b20.h"
 #include "esp_now_driver.h"
+#include "valve.h"
+#include "flow_meter.h"
 
 static const char *TAG = "ZONE_APP";
+
+/* ========================================================================== */
+/*                         GLOBAL ACTUATORS / SENSORS                         */
+/* ========================================================================== */
+
+static valve_t       s_valve;
+static flow_meter_t  s_flow_meter;
+
 
 /* ========================================================================== */
 /*                         NVS ZONE ID STORAGE                                */
@@ -128,6 +139,32 @@ static void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int dat
         }
         break;
 
+    case ESP_NOW_MSG_TYPE_COMMAND:
+        if (data_len >= (int)sizeof(EspNow_CommandPayload_t)) {
+            const EspNow_CommandPayload_t *cmd = (const EspNow_CommandPayload_t *)data;
+            ESP_LOGI(TAG, "Evaluating COMMAND: Target Zone = %u, Open_Valve = %u. My Zone = %u",
+                     cmd->target_zone_id, cmd->open_valve, s_zone_id);
+
+            if (cmd->target_zone_id == s_zone_id) {
+                if (cmd->open_valve) {
+                    ESP_LOGI(TAG, "==== Command Executing: OPEN VALVE ====");
+                    esp_err_t err = valve_open(&s_valve);
+                    if (err != ESP_OK) ESP_LOGE(TAG, "Valve Open Error: %s", esp_err_to_name(err));
+                } else {
+                    ESP_LOGI(TAG, "==== Command Executing: CLOSE VALVE ====");
+                    esp_err_t err = valve_close(&s_valve);
+                    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+                         ESP_LOGW(TAG, "Valve Close Notice: %s", esp_err_to_name(err));
+                    }
+                }
+            } else {
+                ESP_LOGI(TAG, "Command ignored (Target ID %u does not match my ID %u)", cmd->target_zone_id, s_zone_id);
+            }
+        } else {
+            ESP_LOGW(TAG, "Received COMMAND with invalid length %d", data_len);
+        }
+        break;
+
     default:
         break;
     }
@@ -147,43 +184,44 @@ static void zone_perform_discovery(void)
 {
     ESP_LOGI(TAG, "No stored Zone ID — waiting for DISCOVERY_REQ from control...");
 
-    /* Wait for a DISCOVERY_REQ (no timeout: we cannot operate without a zone ID) */
-    xEventGroupWaitBits(s_discovery_eg, EVT_DISC_REQ_RECEIVED, pdTRUE, pdTRUE, portMAX_DELAY);
+    while (1) {
+        /* Wait for a DISCOVERY_REQ (no timeout: we cannot operate without a zone ID) */
+        xEventGroupWaitBits(s_discovery_eg, EVT_DISC_REQ_RECEIVED, pdTRUE, pdTRUE, portMAX_DELAY);
 
-    /* Build and send DISCOVERY_RESP with obfuscated local MAC */
-    uint8_t my_mac[6];
-    esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
+        /* Build and send DISCOVERY_RESP with obfuscated local MAC */
+        uint8_t my_mac[6];
+        esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
 
-    EspNow_DiscoveryRespPayload_t resp = {0};
-    resp.header.version   = ESP_NOW_PROTOCOL_VERSION;
-    resp.header.msg_type  = ESP_NOW_MSG_TYPE_DISCOVERY_RESP;
-    resp.header.sender_id = 0; /* ID not yet known */
-    memcpy(resp.obfuscated_mac, my_mac, 6);
-    EspNow_ObfuscateMAC(resp.obfuscated_mac); /* XOR obfuscation */
+        EspNow_DiscoveryRespPayload_t resp = {0};
+        resp.header.version   = ESP_NOW_PROTOCOL_VERSION;
+        resp.header.msg_type  = ESP_NOW_MSG_TYPE_DISCOVERY_RESP;
+        resp.header.sender_id = 0; /* ID not yet known */
+        memcpy(resp.obfuscated_mac, my_mac, 6);
+        EspNow_ObfuscateMAC(resp.obfuscated_mac); /* XOR obfuscation */
 
-    /* Add control as a peer so we can unicast back */
-    EspNow_AddPeer(s_control_mac);
+        /* Add control as a peer so we can unicast back */
+        EspNow_AddPeer(s_control_mac);
 
-    ESP_LOGI(TAG, "Sending DISCOVERY_RESP to control...");
-    EspNow_Send(s_control_mac, (const uint8_t *)&resp, sizeof(resp));
+        ESP_LOGI(TAG, "Sending DISCOVERY_RESP to control...");
+        EspNow_Send(s_control_mac, (const uint8_t *)&resp, sizeof(resp));
 
-    /* Wait for ZONE_ASSIGN (10 s timeout – then retry entire handshake) */
-    EventBits_t bits = xEventGroupWaitBits(s_discovery_eg, EVT_ZONE_ASSIGNED,
-                                           pdTRUE, pdTRUE,
-                                           pdMS_TO_TICKS(10000));
-    if (bits & EVT_ZONE_ASSIGNED) {
-        s_zone_id = s_assigned_id;
-        esp_err_t err = zone_nvs_save_id(s_zone_id);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Zone ID %u saved to NVS.", s_zone_id);
-        } else {
-            ESP_LOGW(TAG, "Zone ID assigned but NVS save failed: %s", esp_err_to_name(err));
+        /* Wait for ZONE_ASSIGN (10 s timeout – then retry entire handshake) */
+        EventBits_t bits = xEventGroupWaitBits(s_discovery_eg, EVT_ZONE_ASSIGNED,
+                                               pdTRUE, pdTRUE,
+                                               pdMS_TO_TICKS(10000));
+        if (bits & EVT_ZONE_ASSIGNED) {
+            s_zone_id = s_assigned_id;
+            esp_err_t err = zone_nvs_save_id(s_zone_id);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Zone ID %u saved to NVS.", s_zone_id);
+            } else {
+                ESP_LOGW(TAG, "Zone ID assigned but NVS save failed: %s", esp_err_to_name(err));
+            }
+            return; /* Success – exit the loop */
         }
-    } else {
-        ESP_LOGW(TAG, "No ZONE_ASSIGN received in time. Will retry on next DISCOVERY_REQ.");
-        /* Clear any stale bits and loop again */
+
+        ESP_LOGW(TAG, "No ZONE_ASSIGN received in time. Retrying...");
         xEventGroupClearBits(s_discovery_eg, EVT_DISC_REQ_RECEIVED | EVT_ZONE_ASSIGNED);
-        zone_perform_discovery(); /* Recursive retry */
     }
 }
 
@@ -256,8 +294,35 @@ static void CalibrationTask(void *arg)
 }
 
 /* ========================================================================== */
-/*                               APP MAIN                                     */
+/*                         VALVE SAFETY TIMEOUT TASK                          */
 /* ========================================================================== */
+
+/**
+ * @brief Auto-close the valve if it has been open longer than VALVE_TIMEOUT_MS.
+ *
+ * Runs as a background FreeRTOS task. This is a safety mechanism to prevent
+ * flooding if communication with the Control board is lost.
+ */
+static void ValveSafetyTask(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000)); /* Check every 5 seconds */
+
+        if (s_valve.state == VALVE_STATE_OPENED && s_valve.open_start_us != 0U) {
+            uint64_t elapsed_ms = ((uint64_t)esp_timer_get_time() - s_valve.open_start_us) / 1000ULL;
+            if (elapsed_ms >= VALVE_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "SAFETY: Valve open for %llu ms (limit=%u ms). Auto-closing!",
+                         elapsed_ms, VALVE_TIMEOUT_MS);
+                valve_close(&s_valve);
+            }
+        }
+    }
+}
+
+/* ========================================================================== */
+/*                               APP MAIN                                     */
+/* ==========================================================================  */
 
 void app_main(void)
 {
@@ -304,6 +369,19 @@ void app_main(void)
         ESP_LOGW(TAG, "DS18B20 not detected or init failed. Temp readings will be invalid.");
     }
 
+    /* --- Valve --- */
+    s_valve.control_pin = VALVE_CONTROL_PIN;
+    s_valve.timeout_ms  = VALVE_TIMEOUT_MS;
+    if (valve_init(&s_valve) != ESP_OK) {
+        ESP_LOGE(TAG, "Valve init failed");
+    }
+
+    /* --- Flow Meter --- */
+    s_flow_meter.signal_pin = FLOW_METER_PIN;
+    if (flow_meter_init(&s_flow_meter) != ESP_OK) {
+        ESP_LOGE(TAG, "Flow meter init failed");
+    }
+
     /* --- Calibration Button: GPIO Interrupt Setup --- */
     s_cal_semaphore = xSemaphoreCreateBinary();
     configASSERT(s_cal_semaphore != NULL);
@@ -323,6 +401,9 @@ void app_main(void)
 
     /* Create the calibration task (priority just above idle) */
     xTaskCreate(CalibrationTask, "calibration", 4096, &soil_config, 2, NULL);
+
+    /* Create the valve safety timeout task */
+    xTaskCreate(ValveSafetyTask, "valve_safety", 2048, NULL, 1, NULL);
 
     /* --- ESP-NOW --- */
     s_discovery_eg = xEventGroupCreate();
@@ -373,12 +454,22 @@ void app_main(void)
                 snprintf(temp_str, sizeof(temp_str), "%.1f", temp_readings.temperature_c);
             }
 
-            ESP_LOGI(TAG, "[Zone %u] Moisture: %3u%% | Temp: %s C | ADC: %4u | State: %s",
+            /* Read flow meter data */
+            float flow_rate = 0.0f;
+            uint32_t total_volume = 0;
+            flow_meter_get_flow_rate(&s_flow_meter, &flow_rate);
+            flow_meter_get_total_volume_ml(&s_flow_meter, &total_volume);
+
+            uint8_t needs_water = (soil_readings.moisture_percentage < SOIL_MOISTURE_WATER_THRESHOLD) ? 1 : 0;
+
+            ESP_LOGI(TAG, "[Zone %u] Moisture: %3u%% | Temp: %s C | State: %s | Needs Water: %d",
                      s_zone_id,
                      soil_readings.moisture_percentage,
                      temp_str,
-                     soil_readings.adc_reading,
-                     state_str);
+                     state_str,
+                     needs_water);
+            ESP_LOGI(TAG, "          Flow Rate: %.2f L/min | Total Vol: %lu mL | Valve State: %d",
+                     flow_rate, total_volume, s_valve.state);
 
             /* Build and send ZONE_DATA packet */
             EspNow_ZoneDataPayload_t pkt = {0};
@@ -390,6 +481,8 @@ void app_main(void)
             pkt.temperature_c_x10   = temp_readings.valid
                                       ? (int16_t)(temp_readings.temperature_c * 10.0f)
                                       : -999;
+            pkt.needs_water = needs_water;
+            pkt.total_volume_ml = total_volume;
 
             esp_err_t send_err = EspNow_Send(ESP_NOW_BROADCAST_MAC,
                                              (const uint8_t *)&pkt, sizeof(pkt));
@@ -400,6 +493,6 @@ void app_main(void)
             ESP_LOGE(TAG, "Sensor read failed: %s", esp_err_to_name(ret));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL_MS));
     }
 }

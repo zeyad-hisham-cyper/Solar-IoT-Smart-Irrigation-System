@@ -1,3 +1,14 @@
-idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS "."
-                    REQUIRES esp_now nvs_flash esp_hw_support)
+idf_component_register(
+    SRCS 
+        "main.c"
+        "HAL/DcMotor/src/motor.c"
+    INCLUDE_DIRS 
+        "."
+        "include"
+        "HAL/DcMotor/include"
+    REQUIRES 
+        esp_now 
+        driver
+        nvs_flash 
+        esp_hw_support
+)

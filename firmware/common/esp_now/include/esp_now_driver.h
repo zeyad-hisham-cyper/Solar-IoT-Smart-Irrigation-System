@@ -26,7 +26,7 @@ extern "C" {
  * @brief ESP-NOW Protocol Version
  * Increment this version if breaking changes are made to the structures below.
  */
-#define ESP_NOW_PROTOCOL_VERSION 2
+#define ESP_NOW_PROTOCOL_VERSION 3
 
 /**
  * @brief XOR key used to obfuscate MAC addresses in-transit.
@@ -67,8 +67,12 @@ typedef struct __attribute__((packed)) {
     /* Current Sensors */
     uint8_t moisture_percentage;    /**< Soil moisture 0-100% */
     int16_t temperature_c_x10;      /**< Temperature in Celsius * 10 (e.g., 25.4*10 = 254) */
+    
+    /* Valve / Flow State */
+    uint8_t needs_water;            /**< 1 if zone needs water, 0 otherwise */
+    uint32_t total_volume_ml;       /**< Cumulative flow volume in mL */
 
-    /* Future Expansion: Add battery level, valve status, ambient light, etc. below */
+    /* Future Expansion: Add battery level, ambient light, etc. below */
 } EspNow_ZoneDataPayload_t;
 
 /**
@@ -90,6 +94,17 @@ typedef struct __attribute__((packed)) {
     EspNow_MessageHeader_t header;  /**< Must be first; sender_id = 0 (from control) */
     uint8_t assigned_zone_id;       /**< The Zone ID assigned by the control (1-based) */
 } EspNow_ZoneAssignPayload_t;
+
+/**
+ * @brief Command Payload (Control → Zone)
+ *
+ * Used to instruct a zone to open or close its valve.
+ */
+typedef struct __attribute__((packed)) {
+    EspNow_MessageHeader_t header;  /**< Must be first; sender_id = 0 (from control) */
+    uint8_t target_zone_id;         /**< The zone ID this command is intended for */
+    uint8_t open_valve;             /**< 1 to open valve, 0 to close valve */
+} EspNow_CommandPayload_t;
 
 
 /* ========================================================================== */
