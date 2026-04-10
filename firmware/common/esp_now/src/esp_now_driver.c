@@ -39,7 +39,7 @@ static void esp_now_recv_adapter(const esp_now_recv_info_t *esp_now_info,
 /*                             DRIVER INTERFACE                               */
 /* ========================================================================== */
 
-esp_err_t EspNow_Init(void) {
+esp_err_t EspNow_Init(uint8_t channel) {
     esp_err_t err;
 
     /* Initialize NVS (usually required by Wi-Fi Driver) */
@@ -62,6 +62,14 @@ esp_err_t EspNow_Init(void) {
         return err;
     }
 
+    /*
+     * Create the default STA netif BEFORE esp_wifi_init().
+     * This is required so that when WiFi connects to an AP the DHCP client
+     * handler exists. If created after esp_wifi_init(), the Wi-Fi driver
+     * won't attach properly.
+     */
+    esp_netif_create_default_wifi_sta();
+
     /* Configure Wi-Fi in Station Mode (needed for ESP-NOW) */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
@@ -79,9 +87,11 @@ esp_err_t EspNow_Init(void) {
     err = esp_wifi_start();
     if (err != ESP_OK) return err;
 
-    /* Set fixed channel (Channel 1) for both modules */
-    err = esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    if (err != ESP_OK) return err;
+    /* Set WiFi channel if explicitly configured (> 0). */
+    if (channel > 0) {
+        err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        if (err != ESP_OK) return err;
+    }
 
     /* Initialize ESP-NOW */
     err = esp_now_init();
@@ -104,7 +114,13 @@ esp_err_t EspNow_Init(void) {
     /* Log MAC address */
     uint8_t mac_addr[6] = {0};
     esp_read_mac(mac_addr, ESP_MAC_WIFI_STA);
-    ESP_LOGI(TAG, "ESP-NOW Initialized Successfully (Channel 1).");
+
+    if (channel > 0) {
+        ESP_LOGI(TAG, "ESP-NOW Initialized Successfully (Channel %d).", channel);
+    } else {
+        ESP_LOGI(TAG, "ESP-NOW Initialized Successfully (Channel: auto).");
+    }
+
     ESP_LOGI(TAG, "My MAC Address: %02X:%02X:%02X:%02X:%02X:%02X",
              mac_addr[0], mac_addr[1], mac_addr[2],
              mac_addr[3], mac_addr[4], mac_addr[5]);

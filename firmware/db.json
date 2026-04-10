@@ -1,0 +1,55 @@
+{
+  "system": {
+    "mode": "auto"
+  },
+  "gateways": {
+    "g1": {
+      "pump": false,
+      "waterLevel": 0,
+      "lastSeen": 1711111111
+    }
+  },
+  "zones": {
+    "z1": {
+      "g": "g1",
+      "sm": 0,
+      "t": 0,
+      "f": 0,
+      "v": false,
+      "lu": 1711111111,
+      "th": 35,
+      "dur": 120
+    },
+    "z2": {
+      "g": "g1",
+      "sm": 0,
+      "t": 0,
+      "f": 0,
+      "v": false,
+      "lu": 1711111111,
+      "th": 40,
+      "dur": 90
+    }
+  },
+  "commands": {
+    "g1": {
+      "pump": false,
+      "z": {
+        "z1": {
+          "v": false,
+          "d": 0
+        },
+        "z2": {
+          "v": false,
+          "d": 0
+        }
+      },
+      "ts": 1711111111
+    }
+  },
+  "weather": {
+    "rain": false,
+    "temp": 0,
+    "ts": 1711111111
+  }
+}

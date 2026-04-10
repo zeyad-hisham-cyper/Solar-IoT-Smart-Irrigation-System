@@ -29,6 +29,25 @@ extern "C" {
 #define ESP_NOW_PROTOCOL_VERSION 3
 
 /**
+ * @brief WiFi channel for ESP-NOW communication.
+ *
+ * Set to 0 to use the current channel (determined by WiFi STA connection).
+ * Set to 1-13 to force a specific channel.
+ *
+ * On the **control board** (which also connects to a WiFi AP), this should
+ * be 0 so the channel is automatically set by the AP.
+ *
+ * On **zone boards** (no WiFi AP), this should match the AP channel that
+ * the control board connects to.
+ *
+ * Override in your project's app_config.h by defining ESP_NOW_CHANNEL
+ * before including this header.
+ */
+#ifndef ESP_NOW_CHANNEL
+#define ESP_NOW_CHANNEL  0
+#endif
+
+/**
  * @brief XOR key used to obfuscate MAC addresses in-transit.
  * Both control and zone must use the same key.
  * (Not cryptographic – a lightweight deterrent against casual sniffing.)
@@ -145,10 +164,12 @@ typedef void (*EspNow_SendCb_t)(const uint8_t *mac_addr, esp_now_send_status_t s
  * This function also provisions the default Broadcast MAC.
  *
  * @return
- *      - ESP_OK: Success
- *      - ESP_FAIL: Failure
+ * @brief Initialize ESP-NOW.
+ *
+ * @param channel The WiFi channel to use (1-13) or 0 to dynamically track the AP.
+ * @return ESP_OK on success or an error code.
  */
-esp_err_t EspNow_Init(void);
+esp_err_t EspNow_Init(uint8_t channel);
 
 /**
  * @brief Deinitializes ESP-NOW and Wi-Fi.

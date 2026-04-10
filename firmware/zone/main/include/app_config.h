@@ -1,6 +1,21 @@
 #ifndef APP_CONFIG_H
 #define APP_CONFIG_H
 
+/* ========================================================================== */
+/*                       ESP-NOW CHANNEL CONFIGURATION                        */
+/* ========================================================================== */
+
+/**
+ * @brief WiFi channel for ESP-NOW communication.
+ *
+ * This MUST match the channel of the WiFi AP that the control board
+ * connects to. Check your router settings or control board logs for
+ * the actual channel.
+ *
+ * Control board log example: "wifi:new:<8,0>" means channel 8.
+ */
+#define ESP_NOW_CHANNEL  8
+
 #include "driver/gpio.h"
 #include "hal/adc_types.h"
 

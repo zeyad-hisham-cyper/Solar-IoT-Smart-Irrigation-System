@@ -410,7 +410,7 @@ void app_main(void)
     configASSERT(s_discovery_eg != NULL);
 
     ESP_LOGI(TAG, "Initializing ESP-NOW...");
-    if (EspNow_Init() != ESP_OK) {
+    if (EspNow_Init(ESP_NOW_CHANNEL) != ESP_OK) {
         ESP_LOGE(TAG, "ESP-NOW init failed! Halting.");
         return;
     }

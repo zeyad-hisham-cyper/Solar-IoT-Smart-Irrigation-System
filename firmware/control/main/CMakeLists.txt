@@ -2,13 +2,28 @@ idf_component_register(
     SRCS 
         "main.c"
         "HAL/DcMotor/src/motor.c"
+        "HAL/WiFi/src/wifi_manager.c"
+        "Services/FirebaseAuth/src/firebase_auth.c"
+        "Services/FirebaseDB/src/firebase_db.c"
+        "Services/FirebaseSync/src/firebase_sync.c"
     INCLUDE_DIRS 
         "."
         "include"
         "HAL/DcMotor/include"
+        "HAL/WiFi/include"
+        "Services/FirebaseAuth/include"
+        "Services/FirebaseDB/include"
+        "Services/FirebaseSync/include"
     REQUIRES 
         esp_now 
         driver
         nvs_flash 
         esp_hw_support
+        esp_http_client
+        json
+        esp-tls
+        esp_netif
+        esp_event
+        esp_timer
+        esp_wifi
 )

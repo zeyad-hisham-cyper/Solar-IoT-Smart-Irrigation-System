@@ -7,6 +7,7 @@
  *     persist the MAC<->ID mapping in NVS.
  *  3. Data reception: accept ZONE_DATA packets and log them with their Zone ID.
  *  4. Irrigation control: manage the water pump and send valve commands to zones.
+ *  5. Firebase integration: upload gateway + zone data, poll cloud commands.
  */
 
 #include <stdio.h>
@@ -21,6 +22,13 @@
 #include "esp_now_driver.h"
 #include "app_config.h"
 #include "motor.h"
+
+/* ---- Firebase / WiFi headers ---- */
+#include "wifi_manager.h"
+#include "esp_wifi.h"
+#include "firebase_config.h"
+#include "firebase_auth.h"
+#include "firebase_sync.h"
 
 static const char *TAG = "CONTROL_MAIN";
 
@@ -47,6 +55,10 @@ static TickType_t s_zone_last_seen[MAX_ZONES + 1]  = {0};  /**< Last tick a ZONE
 /** In-RAM zone table (rebuilt from NVS on boot) */
 static uint8_t  s_zone_macs[MAX_ZONES][6];
 static uint8_t  s_zone_count = 0;
+
+/* ---- Per-zone MAC cache for sending commands back to zone boards ---- */
+static uint8_t  s_zone_radio_mac[MAX_ZONES + 1][6];  /**< Radio MAC used for ESP-NOW (index by zone_id, 1-based) */
+static bool     s_zone_radio_mac_valid[MAX_ZONES + 1] = {false};
 
 /**
  * @brief Load the zone registry from NVS into RAM.
@@ -176,6 +188,9 @@ static void control_eval_pump_state(void)
         s_pump_running = false;
     }
     /* else: state unchanged, do nothing */
+
+    /* Keep Firebase in sync with the current pump state */
+    firebase_sync_update_gateway(s_pump_running, 100);
 }
 
 /* ========================================================================== */
@@ -185,16 +200,20 @@ static void control_eval_pump_state(void)
 void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 {
     if (data == NULL || data_len < (int)sizeof(EspNow_MessageHeader_t)) {
+        ESP_LOGW(TAG, "ESP-NOW: Received too-short packet (%d bytes) — dropped", data_len);
         return;
     }
 
     const EspNow_MessageHeader_t *header = (const EspNow_MessageHeader_t *)data;
 
+    ESP_LOGI(TAG, "ESP-NOW RX: type=%d ver=%d sender=%d len=%d from %02X:%02X:%02X:%02X:%02X:%02X",
+             header->msg_type, header->version, header->sender_id, data_len,
+             mac_addr[0], mac_addr[1], mac_addr[2],
+             mac_addr[3], mac_addr[4], mac_addr[5]);
+
     if (header->version != ESP_NOW_PROTOCOL_VERSION) {
-        ESP_LOGW(TAG, "Unknown protocol version %d from %02X:%02X:%02X:%02X:%02X:%02X",
-                 header->version,
-                 mac_addr[0], mac_addr[1], mac_addr[2],
-                 mac_addr[3], mac_addr[4], mac_addr[5]);
+        ESP_LOGW(TAG, "Unknown protocol version %d (expected %d) — dropped",
+                 header->version, ESP_NOW_PROTOCOL_VERSION);
         return;
     }
 
@@ -220,6 +239,12 @@ void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
             if (zone_id == 0) return; /* Registration failed */
         } else {
             ESP_LOGI(TAG, "Zone already known -> Zone ID %u", zone_id);
+        }
+
+        /* Cache the radio MAC for sending commands later */
+        if (zone_id >= 1 && zone_id <= MAX_ZONES) {
+            memcpy(s_zone_radio_mac[zone_id], mac_addr, 6);
+            s_zone_radio_mac_valid[zone_id] = true;
         }
 
         /* Make sure the zone's radio MAC is a known peer before replying */
@@ -264,11 +289,33 @@ void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
             ESP_LOGI(TAG, "  Temperature: %.1f C", temp_c);
         }
 
+        /* Cache radio MAC for this zone */
+        if (zone_id >= 1 && zone_id <= MAX_ZONES) {
+            memcpy(s_zone_radio_mac[zone_id], mac_addr, 6);
+            s_zone_radio_mac_valid[zone_id] = true;
+        }
+
         /* Update water tracking for this zone */
         if (zone_id >= 1 && zone_id <= MAX_ZONES) {
             bool state_changed = (s_zone_needs_water[zone_id] != pkt->needs_water);
             s_zone_needs_water[zone_id] = pkt->needs_water;
             s_zone_last_seen[zone_id]   = xTaskGetTickCount();
+
+            /* ---- Update Firebase zone data cache ---- */
+            int fb_idx = zone_id - 1;  /* 0-based index for Firebase */
+            if (fb_idx < NUM_ZONES) {
+                firebase_zone_data_t zd = {
+                    .soil_moisture = pkt->moisture_percentage,
+                    .temperature   = (pkt->temperature_c_x10 == -999) ? 0 : temp_c,
+                    .flow_rate     = 0,  /* Flow rate is cumulative in pkt; approximate */
+                    .valve_open    = pkt->needs_water ? true : false,
+                    .last_update   = 0,  /* Will use epoch in sync task */
+                    .threshold     = 0,  /* Use default from firebase_sync */
+                    .duration      = 0,  /* Use default from firebase_sync */
+                    .valid         = true,
+                };
+                firebase_sync_update_zone(fb_idx, &zd);
+            }
 
             /*
              * Only send a valve COMMAND when the water-need state has actually
@@ -339,6 +386,83 @@ static void control_check_zone_heartbeats(void)
 }
 
 /* ========================================================================== */
+/*                     CLOUD COMMAND APPLICATION TASK                          */
+/* ========================================================================== */
+
+/**
+ * @brief Periodically checks the latest cloud commands and applies them.
+ *
+ * This task reads the cached Firebase commands (populated by firebase_poll_task)
+ * and applies pump state + sends valve commands to zones via ESP-NOW.
+ */
+static void cloud_command_apply_task(void *arg)
+{
+    (void)arg;
+    static firebase_commands_t prev_cmd = {0};
+
+    ESP_LOGI(TAG, "Cloud command apply task started");
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(FIREBASE_POLL_INTERVAL_MS + 500));
+
+        firebase_commands_t cmd;
+        firebase_sync_get_commands(&cmd);
+
+        if (!cmd.valid) continue;
+
+        /* Skip if nothing changed (same timestamp) */
+        if (cmd.timestamp == prev_cmd.timestamp && prev_cmd.valid) continue;
+
+        ESP_LOGI(TAG, "Applying cloud command (ts=%lu)", (unsigned long)cmd.timestamp);
+
+        /* ---- Apply pump command ---- */
+        if (cmd.pump && !s_pump_running) {
+            ESP_LOGI(TAG, "Cloud CMD: PUMP ON");
+            motor_rotate(&s_pump, MOTOR_DIR_CW, MOTOR_SPEED_MAX);
+            s_pump_running = true;
+            firebase_sync_update_gateway(true, 100);
+        } else if (!cmd.pump && s_pump_running) {
+            ESP_LOGI(TAG, "Cloud CMD: PUMP OFF");
+            motor_stop(&s_pump);
+            s_pump_running = false;
+            firebase_sync_update_gateway(false, 100);
+        }
+
+        /* ---- Apply valve commands to zones via ESP-NOW ---- */
+        for (int i = 0; i < NUM_ZONES; i++) {
+            uint8_t zone_id = (uint8_t)(i + 1);
+
+            /* Only send if we know the zone's radio MAC */
+            if (!s_zone_radio_mac_valid[zone_id]) {
+                ESP_LOGD(TAG, "Zone %d radio MAC unknown — skipping valve cmd", zone_id);
+                continue;
+            }
+
+            EspNow_AddPeer(s_zone_radio_mac[zone_id]);
+
+            EspNow_CommandPayload_t valve_cmd = {0};
+            valve_cmd.header.version   = ESP_NOW_PROTOCOL_VERSION;
+            valve_cmd.header.msg_type  = ESP_NOW_MSG_TYPE_COMMAND;
+            valve_cmd.header.sender_id = 0;
+            valve_cmd.target_zone_id   = zone_id;
+            valve_cmd.open_valve       = cmd.zone_valve[i] ? 1 : 0;
+
+            esp_err_t err = EspNow_Send(s_zone_radio_mac[zone_id],
+                                         (const uint8_t *)&valve_cmd, sizeof(valve_cmd));
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Cloud CMD -> Zone %d: %s VALVE", zone_id,
+                         cmd.zone_valve[i] ? "OPEN" : "CLOSE");
+            } else {
+                ESP_LOGE(TAG, "Failed to send cloud valve cmd to zone %d: %s",
+                         zone_id, esp_err_to_name(err));
+            }
+        }
+
+        prev_cmd = cmd;
+    }
+}
+
+/* ========================================================================== */
 /*                                  APP MAIN                                  */
 /* ========================================================================== */
 
@@ -367,12 +491,57 @@ void app_main(void)
     }
 
     /* Initialize ESP-NOW */
-    if (EspNow_Init() != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize ESP-NOW! Halting.");
+    ESP_LOGI(TAG, "Initializing ESP-NOW...");
+    if (EspNow_Init(0) != ESP_OK) {
+        ESP_LOGE(TAG, "ESP-NOW init failed! Halting.");
         return;
     }
     EspNow_RegisterRecvCb(OnEspNowRecvCb);
     ESP_LOGI(TAG, "ESP-NOW Initialized and callback registered.");
+
+    /* ================================================================== */
+    /*                    WiFi + Firebase Initialization                   */
+    /* ================================================================== */
+
+    ESP_LOGI(TAG, "Connecting to WiFi AP \"%s\"...", WIFI_SSID);
+    if (wifi_manager_init() != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi manager init failed");
+    }
+
+    ret = wifi_manager_wait_connected(30000);  /* 30 second timeout */
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi connection failed — Firebase features will be unavailable");
+    } else {
+        /* Log the WiFi channel — zone boards must be on this same channel */
+        uint8_t primary_chan = 0;
+        wifi_second_chan_t secondary_chan;
+        esp_wifi_get_channel(&primary_chan, &secondary_chan);
+        ESP_LOGI(TAG, "WiFi connected on channel %d. Zone boards MUST use the same channel for ESP-NOW.", primary_chan);
+        ESP_LOGI(TAG, "Logging in to Firebase...");
+
+        ret = firebase_auth_login();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Firebase login successful!");
+
+            /* Start background Firebase tasks */
+            xTaskCreate(firebase_upload_task, "fb_upload",  12288, NULL, 3, NULL);
+            xTaskCreate(firebase_poll_task,   "fb_poll",    12288, NULL, 3, NULL);
+            xTaskCreate(cloud_command_apply_task, "cloud_cmd", 4096, NULL, 4, NULL);
+
+            ESP_LOGI(TAG, "Firebase sync tasks started.");
+        } else {
+            ESP_LOGE(TAG, "Firebase login failed — will retry in background tasks");
+
+            /* Start tasks anyway; they will wait until logged in */
+            xTaskCreate(firebase_upload_task, "fb_upload",  12288, NULL, 3, NULL);
+            xTaskCreate(firebase_poll_task,   "fb_poll",    12288, NULL, 3, NULL);
+            xTaskCreate(cloud_command_apply_task, "cloud_cmd", 4096, NULL, 4, NULL);
+        }
+    }
+
+    /* ================================================================== */
+    /*                        ESP-NOW Discovery Loop                       */
+    /* ================================================================== */
 
     /* Allow a small settle period, then broadcast discovery */
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -400,5 +569,8 @@ void app_main(void)
 
         /* Check if any zone has gone silent */
         control_check_zone_heartbeats();
+
+        /* Keep gateway state in sync with Firebase cache */
+        firebase_sync_update_gateway(s_pump_running, 100);
     }
 }
