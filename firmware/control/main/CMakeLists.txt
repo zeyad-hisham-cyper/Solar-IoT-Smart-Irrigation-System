@@ -6,6 +6,8 @@ idf_component_register(
         "Services/FirebaseAuth/src/firebase_auth.c"
         "Services/FirebaseDB/src/firebase_db.c"
         "Services/FirebaseSync/src/firebase_sync.c"
+        "Services/Weather/src/weather_service.c"
+        "Services/IrrigationEngine/src/irrigation_engine.c"
     INCLUDE_DIRS 
         "."
         "include"
@@ -14,6 +16,8 @@ idf_component_register(
         "Services/FirebaseAuth/include"
         "Services/FirebaseDB/include"
         "Services/FirebaseSync/include"
+        "Services/Weather/include"
+        "Services/IrrigationEngine/include"
     REQUIRES 
         esp_now 
         driver

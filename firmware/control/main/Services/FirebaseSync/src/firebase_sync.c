@@ -1,12 +1,21 @@
 /**
  * @file firebase_sync.c
- * @brief Firebase Sync — upload data and poll commands implementation.
+ * @brief Firebase Sync — upload data and poll commands/config implementation.
+ *
+ * Handles:
+ *  - Periodic upload of gateway state, zone sensor data to Firebase
+ *  - Polling gateway mode ("auto"/"manual"), zone configs (th, dur), and
+ *    manual commands from /commands/g1
+ *  - All reads/writes have failure handling: log and retry, never block
+ *  - On read failure: preserve last known config values
  */
 
 #include "firebase_sync.h"
 #include "firebase_config.h"
 #include "firebase_auth.h"
 #include "firebase_db.h"
+#include "irrigation_engine.h"
+#include "app_config.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -26,17 +35,21 @@ static const char *TAG = "FB_SYNC";
 
 static firebase_zone_data_t s_zone_cache[NUM_ZONES] = {0};
 static bool     s_pump_on      = false;
-static int      s_water_level  = 100;       /* Default: full */
+static int      s_water_level  = 0;
 static firebase_commands_t s_commands = {0};
+
+/* Cached gateway mode string */
+static char s_gateway_mode[16] = "auto";
+
+/* Upload task handle for immediate triggering */
+static TaskHandle_t s_upload_task_handle = NULL;
+
+/* Cached zone configs from Firebase */
+static uint8_t  s_zone_threshold[NUM_ZONES] = { DEFAULT_Z1_THRESHOLD, DEFAULT_Z2_THRESHOLD };
+static uint16_t s_zone_duration[NUM_ZONES]  = { DEFAULT_Z1_DURATION,  DEFAULT_Z2_DURATION };
 
 /* Zone ID strings for building paths */
 static const char *ZONE_IDS[NUM_ZONES] = { ZONE_ID_1, ZONE_ID_2 };
-
-/* Default thresholds/durations (can be overridden from the app or cloud) */
-#define DEFAULT_Z1_THRESHOLD   35
-#define DEFAULT_Z1_DURATION    120
-#define DEFAULT_Z2_THRESHOLD   40
-#define DEFAULT_Z2_DURATION    90
 
 /* ========================================================================== */
 /*                   UPDATE FUNCTIONS (called from main.c)                    */
@@ -61,14 +74,32 @@ void firebase_sync_get_commands(firebase_commands_t *out)
     *out = s_commands;
 }
 
+void firebase_sync_get_gateway_mode(char *mode_out, size_t len)
+{
+    if (mode_out == NULL || len == 0) return;
+    strncpy(mode_out, s_gateway_mode, len - 1);
+    mode_out[len - 1] = '\0';
+}
+
+void firebase_sync_get_zone_config(int zone_index, uint8_t *threshold,
+                                    uint16_t *duration)
+{
+    if (zone_index < 0 || zone_index >= NUM_ZONES) return;
+    if (threshold) *threshold = s_zone_threshold[zone_index];
+    if (duration)  *duration  = s_zone_duration[zone_index];
+}
+
+void firebase_sync_trigger_immediate_upload(void)
+{
+    if (s_upload_task_handle != NULL) {
+        xTaskNotifyGive(s_upload_task_handle);
+    }
+}
+
 /* ========================================================================== */
 /*                      HELPER: RE-AUTH ON 401                                 */
 /* ========================================================================== */
 
-/**
- * @brief Re-authenticate if the previous request returned ESP_ERR_INVALID_STATE (401).
- * @return ESP_OK if re-auth succeeded, ESP_FAIL otherwise.
- */
 static esp_err_t try_reauth(void)
 {
     ESP_LOGW(TAG, "Token expired — re-authenticating...");
@@ -79,19 +110,13 @@ static esp_err_t try_reauth(void)
 /*                         EPOCH HELPER                                       */
 /* ========================================================================== */
 
-/**
- * @brief Get a rough epoch timestamp.
- *
- * If SNTP is not configured, falls back to esp_timer uptime in seconds.
- */
 static uint32_t get_epoch(void)
 {
     time_t now;
     time(&now);
-    if (now > 1700000000) {  /* Sanity check: after ~2023 */
+    if (now > 1700000000) {
         return (uint32_t)now;
     }
-    /* Fallback: uptime in seconds */
     return (uint32_t)(esp_timer_get_time() / 1000000ULL);
 }
 
@@ -108,6 +133,7 @@ static char *build_gateway_json(void)
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return NULL;
 
+    cJSON_AddStringToObject(root, "mode",       s_gateway_mode);
     cJSON_AddBoolToObject(root,   "pump",       s_pump_on);
     cJSON_AddNumberToObject(root, "waterLevel", s_water_level);
     cJSON_AddNumberToObject(root, "lastSeen",   (double)get_epoch());
@@ -124,26 +150,44 @@ static char *build_gateway_json(void)
 static char *build_zone_json(int zone_index)
 {
     if (zone_index < 0 || zone_index >= NUM_ZONES) return NULL;
-    const firebase_zone_data_t *z = &s_zone_cache[zone_index];
+
+    /* Get live state from the irrigation engine if available */
+    irrigation_zone_t eng_state;
+    bool have_engine_state = false;
+    uint8_t zone_id = (uint8_t)(zone_index + 1);
+    if (irrigation_engine_get_zone_state(zone_id, &eng_state) == ESP_OK) {
+        have_engine_state = true;
+    }
 
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return NULL;
 
     cJSON_AddStringToObject(root, "g",  GATEWAY_ID);
-    cJSON_AddNumberToObject(root, "sm", z->soil_moisture);
-    cJSON_AddNumberToObject(root, "t",  z->valid ? z->temperature : 0);
-    cJSON_AddNumberToObject(root, "f",  z->valid ? z->flow_rate   : 0);
-    cJSON_AddBoolToObject  (root, "v",  z->valve_open);
+
+    if (have_engine_state && eng_state.data_valid) {
+        cJSON_AddNumberToObject(root, "sm", eng_state.sm);
+        cJSON_AddNumberToObject(root, "t",  eng_state.temp);
+        cJSON_AddNumberToObject(root, "f",  eng_state.flow);
+        cJSON_AddBoolToObject  (root, "v",  eng_state.valve_open);
+        cJSON_AddNumberToObject(root, "th", eng_state.threshold);
+        cJSON_AddNumberToObject(root, "dur",eng_state.duration);
+    } else {
+        /* Fallback to the zone cache */
+        const firebase_zone_data_t *z = &s_zone_cache[zone_index];
+        cJSON_AddNumberToObject(root, "sm", z->soil_moisture);
+        cJSON_AddNumberToObject(root, "t",  z->valid ? z->temperature : 0);
+        cJSON_AddNumberToObject(root, "f",  z->valid ? z->flow_rate   : 0);
+        cJSON_AddBoolToObject  (root, "v",  z->valve_open);
+
+        int th  = z->threshold > 0 ? z->threshold :
+                  (zone_index == 0 ? DEFAULT_Z1_THRESHOLD : DEFAULT_Z2_THRESHOLD);
+        int dur = z->duration  > 0 ? z->duration  :
+                  (zone_index == 0 ? DEFAULT_Z1_DURATION  : DEFAULT_Z2_DURATION);
+        cJSON_AddNumberToObject(root, "th",  th);
+        cJSON_AddNumberToObject(root, "dur", dur);
+    }
+
     cJSON_AddNumberToObject(root, "lu", (double)get_epoch());
-
-    /* Threshold and duration — use zone-specific defaults if not set */
-    int th  = z->threshold > 0 ? z->threshold :
-              (zone_index == 0 ? DEFAULT_Z1_THRESHOLD : DEFAULT_Z2_THRESHOLD);
-    int dur = z->duration  > 0 ? z->duration  :
-              (zone_index == 0 ? DEFAULT_Z1_DURATION  : DEFAULT_Z2_DURATION);
-
-    cJSON_AddNumberToObject(root, "th",  th);
-    cJSON_AddNumberToObject(root, "dur", dur);
 
     char *str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -159,8 +203,11 @@ void firebase_upload_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG, "Upload task started (interval: %d ms)", FIREBASE_UPLOAD_INTERVAL_MS);
 
+    s_upload_task_handle = xTaskGetCurrentTaskHandle();
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(FIREBASE_UPLOAD_INTERVAL_MS));
+        /* Wait for periodic interval or immediate trigger */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FIREBASE_UPLOAD_INTERVAL_MS));
 
         if (!firebase_auth_is_logged_in()) {
             ESP_LOGW(TAG, "Not logged in — skipping upload");
@@ -182,18 +229,13 @@ void firebase_upload_task(void *arg)
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "Gateway state uploaded");
             } else {
-                ESP_LOGE(TAG, "Gateway upload failed");
+                ESP_LOGE(TAG, "Gateway upload failed (will retry next cycle)");
             }
             free(gw_json);
         }
 
         /* ---- Upload zone data ---- */
         for (int i = 0; i < NUM_ZONES; i++) {
-            if (!s_zone_cache[i].valid) {
-                ESP_LOGW(TAG, "Zone %s: no data yet, skipping", ZONE_IDS[i]);
-                continue;
-            }
-
             char *z_json = build_zone_json(i);
             if (z_json != NULL) {
                 char path[64];
@@ -228,7 +270,7 @@ static void parse_commands(const char *json_str)
     cJSON *root = cJSON_Parse(json_str);
     if (root == NULL) {
         ESP_LOGE(TAG, "Failed to parse commands JSON");
-        s_commands.valid = false;
+        /* Keep previous valid commands — do not reset */
         return;
     }
 
@@ -282,14 +324,71 @@ static void parse_commands(const char *json_str)
              s_commands.zone_valve[1], s_commands.zone_duration[1]);
 }
 
+/**
+ * @brief Parse the gateway JSON to extract mode.
+ */
+static void parse_gateway_mode(const char *json_str)
+{
+    cJSON *root = cJSON_Parse(json_str);
+    if (root == NULL || cJSON_IsNull(root)) {
+        ESP_LOGW(TAG, "Failed to parse gateway JSON for mode — keeping: %s", s_gateway_mode);
+        if (root) cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *mode_j = cJSON_GetObjectItem(root, "mode");
+    if (cJSON_IsString(mode_j) && mode_j->valuestring != NULL) {
+        strncpy(s_gateway_mode, mode_j->valuestring, sizeof(s_gateway_mode) - 1);
+        s_gateway_mode[sizeof(s_gateway_mode) - 1] = '\0';
+        ESP_LOGI(TAG, "Gateway mode: %s", s_gateway_mode);
+    }
+
+    cJSON_Delete(root);
+}
+
+/**
+ * @brief Parse a zone JSON to extract th and dur, and feed to irrigation engine.
+ */
+static void parse_zone_config(int zone_index, const char *json_str)
+{
+    cJSON *root = cJSON_Parse(json_str);
+    if (root == NULL || cJSON_IsNull(root)) {
+        ESP_LOGW(TAG, "Zone %s config parse failed — keeping previous values",
+                 ZONE_IDS[zone_index]);
+        if (root) cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *th_j  = cJSON_GetObjectItem(root, "th");
+    cJSON *dur_j = cJSON_GetObjectItem(root, "dur");
+
+    if (cJSON_IsNumber(th_j) && th_j->valuedouble > 0) {
+        s_zone_threshold[zone_index] = (uint8_t)th_j->valuedouble;
+    }
+    if (cJSON_IsNumber(dur_j) && dur_j->valuedouble > 0) {
+        s_zone_duration[zone_index] = (uint16_t)dur_j->valuedouble;
+    }
+
+    cJSON_Delete(root);
+
+    /* Feed updated config to the irrigation engine */
+    uint8_t zone_id = (uint8_t)(zone_index + 1);
+    irrigation_engine_set_zone_config(zone_id,
+                                       s_zone_threshold[zone_index],
+                                       s_zone_duration[zone_index]);
+
+    ESP_LOGI(TAG, "Zone %s config: th=%u dur=%u",
+             ZONE_IDS[zone_index],
+             s_zone_threshold[zone_index],
+             s_zone_duration[zone_index]);
+}
+
 void firebase_poll_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "Poll task started (interval: %d ms)", FIREBASE_POLL_INTERVAL_MS);
 
     char resp_buf[FIREBASE_RESPONSE_MAX_LEN];
-    char path[64];
-    snprintf(path, sizeof(path), "commands/%s", GATEWAY_ID);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(FIREBASE_POLL_INTERVAL_MS));
@@ -299,18 +398,66 @@ void firebase_poll_task(void *arg)
             continue;
         }
 
-        esp_err_t err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
-        if (err == ESP_ERR_INVALID_STATE) {
-            if (try_reauth() == ESP_OK) {
-                err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+        /* ---- 1. Poll gateway mode ---- */
+        {
+            char path[64];
+            snprintf(path, sizeof(path), "gateways/%s", GATEWAY_ID);
+
+            esp_err_t err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+            if (err == ESP_ERR_INVALID_STATE) {
+                if (try_reauth() == ESP_OK) {
+                    err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+                }
+            }
+            if (err == ESP_OK) {
+                parse_gateway_mode(resp_buf);
+
+                /* Update irrigation engine mode */
+                if (strcmp(s_gateway_mode, "manual") == 0) {
+                    irrigation_engine_set_mode(IRRIGATION_MODE_MANUAL);
+                } else {
+                    irrigation_engine_set_mode(IRRIGATION_MODE_AUTO);
+                }
+            } else {
+                ESP_LOGW(TAG, "Gateway mode poll failed — keeping: %s", s_gateway_mode);
             }
         }
 
-        if (err == ESP_OK) {
-            parse_commands(resp_buf);
-        } else {
-            ESP_LOGE(TAG, "Command poll failed");
-            s_commands.valid = false;
+        /* ---- 2. Poll zone configs (th, dur) ---- */
+        for (int i = 0; i < NUM_ZONES; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "zones/%s", ZONE_IDS[i]);
+
+            esp_err_t err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+            if (err == ESP_ERR_INVALID_STATE) {
+                if (try_reauth() == ESP_OK) {
+                    err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+                }
+            }
+            if (err == ESP_OK) {
+                parse_zone_config(i, resp_buf);
+            } else {
+                ESP_LOGW(TAG, "Zone %s config poll failed — keeping previous", ZONE_IDS[i]);
+            }
+        }
+
+        /* ---- 3. Poll commands (only relevant in manual mode) ---- */
+        {
+            char path[64];
+            snprintf(path, sizeof(path), "commands/%s", GATEWAY_ID);
+
+            esp_err_t err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+            if (err == ESP_ERR_INVALID_STATE) {
+                if (try_reauth() == ESP_OK) {
+                    err = firebase_db_get(path, resp_buf, sizeof(resp_buf));
+                }
+            }
+            if (err == ESP_OK) {
+                parse_commands(resp_buf);
+            } else {
+                ESP_LOGW(TAG, "Command poll failed — keeping previous commands");
+                /* Do NOT invalidate s_commands — keep last known */
+            }
         }
     }
 }

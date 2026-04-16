@@ -3,11 +3,12 @@
  * @brief Firebase Sync — background tasks for uploading data and polling commands.
  *
  * Provides FreeRTOS task functions that periodically:
- *  - Upload gateway state and zone sensor data to Firebase RTDB
- *  - Poll the commands endpoint and apply changes locally
+ *  - Upload gateway state, zone sensor data, and weather to Firebase RTDB
+ *  - Poll the commands endpoint, gateway mode, and zone configs
  *
- * The module exposes a shared zone data cache that main.c populates from
- * ESP-NOW callbacks. The sync tasks read this cache to build JSON payloads.
+ * The module exposes a shared data cache that main.c / irrigation_engine
+ * populate from ESP-NOW callbacks.  The sync tasks read this cache to build
+ * JSON payloads and feed configuration back to the irrigation engine.
  */
 
 #ifndef FIREBASE_SYNC_H
@@ -15,6 +16,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,7 +27,7 @@ extern "C" {
 /* ========================================================================== */
 
 /**
- * @brief Cached sensor data for one zone (populated by main.c from ESP-NOW).
+ * @brief Cached sensor data for one zone (populated from ESP-NOW).
  */
 typedef struct {
     uint8_t  soil_moisture;       /**< 0-100 % */
@@ -76,6 +78,29 @@ void firebase_sync_update_gateway(bool pump_on, int water_level);
  */
 void firebase_sync_get_commands(firebase_commands_t *out);
 
+/**
+ * @brief Get the current gateway mode from Firebase.
+ *
+ * @param[out] mode_out  Buffer to write mode string ("auto" or "manual").
+ * @param      len       Size of mode_out buffer.
+ */
+void firebase_sync_get_gateway_mode(char *mode_out, size_t len);
+
+/**
+ * @brief Get zone configuration (threshold, duration) from Firebase.
+ *
+ * @param zone_index   0-based index (0 = z1, 1 = z2).
+ * @param[out] threshold  Pointer to receive threshold value.
+ * @param[out] duration   Pointer to receive duration value.
+ */
+void firebase_sync_get_zone_config(int zone_index, uint8_t *threshold,
+                                    uint16_t *duration);
+
+/**
+ * @brief Trigger an immediate upload of states (e.g. on critical changes).
+ */
+void firebase_sync_trigger_immediate_upload(void);
+
 /* ========================================================================== */
 /*                        FREERTOS TASK FUNCTIONS                             */
 /* ========================================================================== */
@@ -84,15 +109,15 @@ void firebase_sync_get_commands(firebase_commands_t *out);
  * @brief FreeRTOS task: periodically uploads gateway + zone data to Firebase.
  *
  * Create with xTaskCreate(). Task parameter is unused (pass NULL).
- * Stack size recommendation: 8192 bytes.
+ * Stack size recommendation: 12288 bytes.
  */
 void firebase_upload_task(void *arg);
 
 /**
- * @brief FreeRTOS task: periodically polls /commands/g1 and caches the result.
+ * @brief FreeRTOS task: periodically polls commands, mode, and zone configs.
  *
  * Create with xTaskCreate(). Task parameter is unused (pass NULL).
- * Stack size recommendation: 8192 bytes.
+ * Stack size recommendation: 12288 bytes.
  */
 void firebase_poll_task(void *arg);
 

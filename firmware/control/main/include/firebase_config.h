@@ -54,10 +54,10 @@ extern "C" {
 /* ========================================================================== */
 
 /** Interval between gateway + zone data uploads */
-#define FIREBASE_UPLOAD_INTERVAL_MS     15000
+#define FIREBASE_UPLOAD_INTERVAL_MS     2000
 
 /** Interval between command polls */
-#define FIREBASE_POLL_INTERVAL_MS       5000
+#define FIREBASE_POLL_INTERVAL_MS       2000
 
 /* ========================================================================== */
 /*                          HTTP BUFFER SIZES                                 */

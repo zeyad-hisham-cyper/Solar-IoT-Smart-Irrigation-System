@@ -1,9 +1,7 @@
 {
-  "system": {
-    "mode": "auto"
-  },
   "gateways": {
     "g1": {
+      "mode": "auto",
       "pump": false,
       "waterLevel": 0,
       "lastSeen": 1711111111
@@ -48,7 +46,7 @@
     }
   },
   "weather": {
-    "rain": false,
+    "rainNow": false,
     "temp": 0,
     "ts": 1711111111
   }

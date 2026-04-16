@@ -26,6 +26,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_mac.h"
+#include "esp_wifi.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 
@@ -52,28 +53,106 @@ static flow_meter_t  s_flow_meter;
 
 #define ZONE_NVS_NAMESPACE  "zone_cfg"
 #define ZONE_NVS_KEY_ID     "zone_id"
+#define ZONE_NVS_KEY_MAC    "ctrl_mac"
+
+/** @brief Maximum consecutive send failures before clearing NVS and restarting discovery. */
+#define SEND_FAIL_THRESHOLD  5
 
 static uint8_t s_zone_id = 0; /**< 0 means "not yet assigned" */
+static uint8_t s_control_mac[6] = {0};
+static int     s_send_fail_count = 0;  /**< Consecutive ESP-NOW send failures */
 
-static esp_err_t zone_nvs_save_id(uint8_t id)
+/**
+ * @brief Check whether a 6-byte MAC address is all zeros (invalid).
+ * @return true if every byte is 0x00.
+ */
+static bool is_zero_mac(const uint8_t mac[6])
+{
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 0) return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Erase the stored zone config (zone ID + gateway MAC) from NVS.
+ */
+static esp_err_t zone_nvs_clear_config(void)
+{
+    nvs_handle_t h;
+    esp_err_t ret = nvs_open(ZONE_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (ret != ESP_OK) return ret;
+    nvs_erase_key(h, ZONE_NVS_KEY_ID);
+    nvs_erase_key(h, ZONE_NVS_KEY_MAC);
+    ret = nvs_commit(h);
+    nvs_close(h);
+    return ret;
+}
+
+/**
+ * @brief Ensure the gateway MAC is registered as an ESP-NOW peer.
+ *
+ * Removes any stale entry first, then adds fresh.  Logs every step.
+ *
+ * @param mac  6-byte gateway MAC to register.
+ * @return ESP_OK on success.
+ */
+static esp_err_t ensure_gateway_peer(const uint8_t mac[6])
+{
+    ESP_LOGI(TAG, "ensure_gateway_peer: MAC=%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    if (is_zero_mac(mac)) {
+        ESP_LOGE(TAG, "ensure_gateway_peer: REFUSED — MAC is all zeros");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Remove old entry (ignore "not found" — it just means it wasn't there) */
+    if (esp_now_is_peer_exist(mac)) {
+        esp_err_t del = esp_now_del_peer(mac);
+        ESP_LOGI(TAG, "ensure_gateway_peer: del_peer result=%s", esp_err_to_name(del));
+    }
+
+    esp_now_peer_info_t pi = {0};
+    memcpy(pi.peer_addr, mac, 6);
+    pi.channel = 0;        /* use current channel */
+    pi.encrypt = false;
+    pi.ifidx   = WIFI_IF_STA;
+
+    esp_err_t add = esp_now_add_peer(&pi);
+    ESP_LOGI(TAG, "ensure_gateway_peer: add_peer result=%s  peer_exist=%s",
+             esp_err_to_name(add),
+             esp_now_is_peer_exist(mac) ? "YES" : "NO");
+    return add;
+}
+
+static esp_err_t zone_nvs_save_config(uint8_t id, const uint8_t *mac)
 {
     nvs_handle_t h;
     esp_err_t ret = nvs_open(ZONE_NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
     ret = nvs_set_u8(h, ZONE_NVS_KEY_ID, id);
+    if (ret == ESP_OK) ret = nvs_set_blob(h, ZONE_NVS_KEY_MAC, mac, 6);
     if (ret == ESP_OK) ret = nvs_commit(h);
     nvs_close(h);
     return ret;
 }
 
-static uint8_t zone_nvs_load_id(void)
+static uint8_t zone_nvs_load_config(void)
 {
     nvs_handle_t h;
     if (nvs_open(ZONE_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return 0;
+    
     uint8_t id = 0;
-    nvs_get_u8(h, ZONE_NVS_KEY_ID, &id);
+    size_t mac_len = 6;
+    if (nvs_get_u8(h, ZONE_NVS_KEY_ID, &id) == ESP_OK) {
+        if (nvs_get_blob(h, ZONE_NVS_KEY_MAC, s_control_mac, &mac_len) == ESP_OK && mac_len == 6) {
+            nvs_close(h);
+            return id;
+        }
+    }
     nvs_close(h);
-    return id;
+    return 0;
 }
 
 /* ========================================================================== */
@@ -85,8 +164,15 @@ static uint8_t zone_nvs_load_id(void)
 #define EVT_ZONE_ASSIGNED      BIT1
 
 static EventGroupHandle_t  s_discovery_eg = NULL;
-static uint8_t             s_control_mac[6];   /**< MAC of the control board */
 static uint8_t             s_assigned_id  = 0; /**< ID received from control */
+
+/* Current sensor states for the transmission task */
+static uint8_t  s_current_sm = 0;
+static float    s_current_temp = 0.0f;
+static bool     s_current_temp_valid = false;
+static float    s_current_flow = 0.0f;
+static uint32_t s_current_total_vol = 0;
+static uint8_t  s_current_needs_water = 0;
 
 /* ========================================================================== */
 /*                         CALIBRATION INTERRUPT                              */
@@ -111,6 +197,18 @@ static void IRAM_ATTR calibration_button_isr(void *arg)
 /*                         ESP-NOW RECEIVE CALLBACK                           */
 /* ========================================================================== */
 
+static void OnEspNowSendCb(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        s_send_fail_count = 0;
+        ESP_LOGI(TAG, "ZONE: send OK (fail counter reset)");
+    } else {
+        s_send_fail_count++;
+        ESP_LOGE(TAG, "ZONE: send FAIL (consecutive failures: %d/%d)",
+                 s_send_fail_count, SEND_FAIL_THRESHOLD);
+    }
+}
+
 static void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 {
     if (data == NULL || data_len < (int)sizeof(EspNow_MessageHeader_t)) return;
@@ -124,9 +222,12 @@ static void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int dat
     case ESP_NOW_MSG_TYPE_DISCOVERY_REQ:
         /* Control is broadcasting; save its MAC and signal the discovery task */
         memcpy(s_control_mac, mac_addr, 6);
-        ESP_LOGI(TAG, "DISCOVERY_REQ from control %02X:%02X:%02X:%02X:%02X:%02X",
+        ESP_LOGI(TAG, "DISCOVERY_REQ from sender MAC %02X:%02X:%02X:%02X:%02X:%02X",
                  mac_addr[0], mac_addr[1], mac_addr[2],
                  mac_addr[3], mac_addr[4], mac_addr[5]);
+        ESP_LOGI(TAG, "  -> s_control_mac updated to %02X:%02X:%02X:%02X:%02X:%02X",
+                 s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                 s_control_mac[3], s_control_mac[4], s_control_mac[5]);
         xEventGroupSetBits(s_discovery_eg, EVT_DISC_REQ_RECEIVED);
         break;
 
@@ -134,7 +235,20 @@ static void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int dat
         if (data_len >= (int)sizeof(EspNow_ZoneAssignPayload_t)) {
             const EspNow_ZoneAssignPayload_t *pkt = (const EspNow_ZoneAssignPayload_t *)data;
             s_assigned_id = pkt->assigned_zone_id;
-            ESP_LOGI(TAG, "ZONE_ASSIGN received: Zone ID = %u", s_assigned_id);
+            /*
+             * CRITICAL FIX: Always capture the sender's MAC here.
+             * When the control responds directly to a broadcast DISCOVERY_RESP
+             * with ZONE_ASSIGN (without first sending DISCOVERY_REQ),
+             * this is the ONLY place we learn the gateway's real MAC.
+             */
+            memcpy(s_control_mac, mac_addr, 6);
+            ESP_LOGI(TAG, "ZONE_ASSIGN from sender MAC %02X:%02X:%02X:%02X:%02X:%02X, Zone ID=%u",
+                     mac_addr[0], mac_addr[1], mac_addr[2],
+                     mac_addr[3], mac_addr[4], mac_addr[5],
+                     s_assigned_id);
+            ESP_LOGI(TAG, "  -> s_control_mac set to %02X:%02X:%02X:%02X:%02X:%02X",
+                     s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                     s_control_mac[3], s_control_mac[4], s_control_mac[5]);
             xEventGroupSetBits(s_discovery_eg, EVT_ZONE_ASSIGNED);
         }
         break;
@@ -182,46 +296,118 @@ static void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int dat
  */
 static void zone_perform_discovery(void)
 {
-    ESP_LOGI(TAG, "No stored Zone ID — waiting for DISCOVERY_REQ from control...");
+    ESP_LOGI(TAG, "=== DISCOVERY START ===");
+
+    /* Clear any stale state so we don't trust leftovers */
+    memset(s_control_mac, 0, 6);
+
+    /* Prepare DISCOVERY_RESP payload to actively ping the gateway */
+    uint8_t my_mac[6];
+    esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
+    ESP_LOGI(TAG, "My STA MAC: %02X:%02X:%02X:%02X:%02X:%02X",
+             my_mac[0], my_mac[1], my_mac[2],
+             my_mac[3], my_mac[4], my_mac[5]);
+
+    EspNow_DiscoveryRespPayload_t resp = {0};
+    resp.header.version   = ESP_NOW_PROTOCOL_VERSION;
+    resp.header.msg_type  = ESP_NOW_MSG_TYPE_DISCOVERY_RESP;
+    resp.header.sender_id = 0; /* ID not yet known */
+    memcpy(resp.obfuscated_mac, my_mac, 6);
+    EspNow_ObfuscateMAC(resp.obfuscated_mac);
+
+    uint8_t current_channel = 1;
 
     while (1) {
-        /* Wait for a DISCOVERY_REQ (no timeout: we cannot operate without a zone ID) */
-        xEventGroupWaitBits(s_discovery_eg, EVT_DISC_REQ_RECEIVED, pdTRUE, pdTRUE, portMAX_DELAY);
+        esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+        ESP_LOGI(TAG, "Scanning channel %d...", current_channel);
 
-        /* Build and send DISCOVERY_RESP with obfuscated local MAC */
-        uint8_t my_mac[6];
-        esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
+        /* Actively probe for the control board */
+        EspNow_Send(ESP_NOW_BROADCAST_MAC, (const uint8_t *)&resp, sizeof(resp));
 
-        EspNow_DiscoveryRespPayload_t resp = {0};
-        resp.header.version   = ESP_NOW_PROTOCOL_VERSION;
-        resp.header.msg_type  = ESP_NOW_MSG_TYPE_DISCOVERY_RESP;
-        resp.header.sender_id = 0; /* ID not yet known */
-        memcpy(resp.obfuscated_mac, my_mac, 6);
-        EspNow_ObfuscateMAC(resp.obfuscated_mac); /* XOR obfuscation */
+        /* Wait up to 500ms for a ZONE_ASSIGN response (or serendipitous DISCOVERY_REQ) */
+        EventBits_t bits = xEventGroupWaitBits(s_discovery_eg, 
+                                               EVT_DISC_REQ_RECEIVED | EVT_ZONE_ASSIGNED,
+                                               pdTRUE, pdFALSE,
+                                               pdMS_TO_TICKS(500));
 
-        /* Add control as a peer so we can unicast back */
-        EspNow_AddPeer(s_control_mac);
-
-        ESP_LOGI(TAG, "Sending DISCOVERY_RESP to control...");
-        EspNow_Send(s_control_mac, (const uint8_t *)&resp, sizeof(resp));
-
-        /* Wait for ZONE_ASSIGN (10 s timeout – then retry entire handshake) */
-        EventBits_t bits = xEventGroupWaitBits(s_discovery_eg, EVT_ZONE_ASSIGNED,
-                                               pdTRUE, pdTRUE,
-                                               pdMS_TO_TICKS(10000));
         if (bits & EVT_ZONE_ASSIGNED) {
-            s_zone_id = s_assigned_id;
-            esp_err_t err = zone_nvs_save_id(s_zone_id);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "Zone ID %u saved to NVS.", s_zone_id);
-            } else {
-                ESP_LOGW(TAG, "Zone ID assigned but NVS save failed: %s", esp_err_to_name(err));
+            /* ZONE_ASSIGN handler already captured mac_addr → s_control_mac */
+            ESP_LOGI(TAG, "ZONE_ASSIGN received directly on channel %d", current_channel);
+            ESP_LOGI(TAG, "  gateway MAC from callback: %02X:%02X:%02X:%02X:%02X:%02X",
+                     s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                     s_control_mac[3], s_control_mac[4], s_control_mac[5]);
+
+            /* Validate before committing */
+            if (is_zero_mac(s_control_mac)) {
+                ESP_LOGE(TAG, "BUG: gateway MAC is still 00:00:00:00:00:00 after ZONE_ASSIGN — retrying");
+                continue; /* keep scanning */
             }
-            return; /* Success – exit the loop */
+
+            s_zone_id = s_assigned_id;
+            s_send_fail_count = 0;
+
+            /* Register peer with ESP-NOW */
+            ensure_gateway_peer(s_control_mac);
+
+            /* Save to NVS */
+            esp_err_t err = zone_nvs_save_config(s_zone_id, s_control_mac);
+            ESP_LOGI(TAG, "NVS save: zone_id=%u MAC=%02X:%02X:%02X:%02X:%02X:%02X result=%s",
+                     s_zone_id,
+                     s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                     s_control_mac[3], s_control_mac[4], s_control_mac[5],
+                     esp_err_to_name(err));
+
+            ESP_LOGI(TAG, "=== DISCOVERY SUCCESS (zone_id=%u, channel=%d) ===",
+                     s_zone_id, current_channel);
+            return;
         }
 
-        ESP_LOGW(TAG, "No ZONE_ASSIGN received in time. Retrying...");
-        xEventGroupClearBits(s_discovery_eg, EVT_DISC_REQ_RECEIVED | EVT_ZONE_ASSIGNED);
+        if (bits & EVT_DISC_REQ_RECEIVED) {
+            ESP_LOGI(TAG, "DISCOVERY_REQ on channel %d, replying with DISCOVERY_RESP", current_channel);
+            ESP_LOGI(TAG, "  gateway MAC from callback: %02X:%02X:%02X:%02X:%02X:%02X",
+                     s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                     s_control_mac[3], s_control_mac[4], s_control_mac[5]);
+
+            /* Add peer so unicast DISCOVERY_RESP can be sent */
+            ensure_gateway_peer(s_control_mac);
+            EspNow_Send(s_control_mac, (const uint8_t *)&resp, sizeof(resp));
+
+            /* Wait a bit longer for the ZONE_ASSIGN on this matched channel */
+            EventBits_t bits2 = xEventGroupWaitBits(s_discovery_eg, EVT_ZONE_ASSIGNED,
+                                                    pdTRUE, pdTRUE, pdMS_TO_TICKS(3000));
+            if (bits2 & EVT_ZONE_ASSIGNED) {
+                /* ZONE_ASSIGN handler may have updated s_control_mac again */
+                ESP_LOGI(TAG, "ZONE_ASSIGN after DISCOVERY_REQ on channel %d", current_channel);
+                ESP_LOGI(TAG, "  gateway MAC from callback: %02X:%02X:%02X:%02X:%02X:%02X",
+                         s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                         s_control_mac[3], s_control_mac[4], s_control_mac[5]);
+
+                if (is_zero_mac(s_control_mac)) {
+                    ESP_LOGE(TAG, "BUG: gateway MAC is still zero after ZONE_ASSIGN — retrying");
+                    continue;
+                }
+
+                s_zone_id = s_assigned_id;
+                s_send_fail_count = 0;
+
+                /* Re-ensure peer (MAC may have changed between REQ and ASSIGN) */
+                ensure_gateway_peer(s_control_mac);
+
+                esp_err_t save_err = zone_nvs_save_config(s_zone_id, s_control_mac);
+                ESP_LOGI(TAG, "NVS save: zone_id=%u MAC=%02X:%02X:%02X:%02X:%02X:%02X result=%s",
+                         s_zone_id,
+                         s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                         s_control_mac[3], s_control_mac[4], s_control_mac[5],
+                         esp_err_to_name(save_err));
+
+                ESP_LOGI(TAG, "=== DISCOVERY SUCCESS (zone_id=%u, channel=%d) ===",
+                         s_zone_id, current_channel);
+                return;
+            }
+        }
+
+        current_channel++;
+        if (current_channel > 13) current_channel = 1;
     }
 }
 
@@ -321,6 +507,75 @@ static void ValveSafetyTask(void *arg)
 }
 
 /* ========================================================================== */
+/*                         PERIODIC TRANSMISSION TASK                         */
+/* ========================================================================== */
+
+static void ZoneTransmissionTask(void *arg)
+{
+    (void)arg;
+    uint32_t tick = 0;
+    
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        
+        ESP_LOGI(TAG, "ZONE: loop tick %lu", (unsigned long)tick++);
+        
+        if (s_zone_id == 0 || is_zero_mac(s_control_mac)) {
+            /* Not paired yet — do not attempt to send */
+            ESP_LOGW(TAG, "ZONE: not paired (zone_id=%u, mac_valid=%s) — waiting",
+                     s_zone_id, is_zero_mac(s_control_mac) ? "NO" : "YES");
+            continue;
+        }
+
+        /* ------ Send-fail recovery: too many consecutive failures → re-discover ------ */
+        if (s_send_fail_count >= SEND_FAIL_THRESHOLD) {
+            ESP_LOGW(TAG, "RECOVERY: %d consecutive send failures → clearing NVS and restarting discovery",
+                     s_send_fail_count);
+            zone_nvs_clear_config();
+            memset(s_control_mac, 0, 6);
+            s_zone_id = 0;
+            s_send_fail_count = 0;
+            zone_perform_discovery();
+            ESP_LOGI(TAG, "RECOVERY: discovery complete, resuming transmissions");
+            continue;
+        }
+
+        /* Verify peer is registered before every send */
+        if (!esp_now_is_peer_exist(s_control_mac)) {
+            ESP_LOGW(TAG, "ZONE: peer not in table — re-adding");
+            ensure_gateway_peer(s_control_mac);
+        }
+
+        /* Build and send ZONE_DATA packet using last known good values */
+        EspNow_ZoneDataPayload_t pkt = {0};
+        pkt.header.version   = ESP_NOW_PROTOCOL_VERSION;
+        pkt.header.msg_type  = ESP_NOW_MSG_TYPE_ZONE_DATA;
+        pkt.header.sender_id = s_zone_id;
+
+        pkt.moisture_percentage = s_current_sm;
+        pkt.temperature_c_x10   = s_current_temp_valid
+                                  ? (int16_t)(s_current_temp * 10.0f)
+                                  : -999;
+        pkt.needs_water = s_current_needs_water;
+        pkt.total_volume_ml = s_current_total_vol;
+
+        ESP_LOGI(TAG, "ZONE: TX -> %02X:%02X:%02X:%02X:%02X:%02X  zone_id=%u  SM=%u  fail_cnt=%d",
+                 s_control_mac[0], s_control_mac[1], s_control_mac[2],
+                 s_control_mac[3], s_control_mac[4], s_control_mac[5],
+                 s_zone_id, pkt.moisture_percentage, s_send_fail_count);
+
+        esp_err_t send_err = EspNow_Send(s_control_mac, (const uint8_t *)&pkt, sizeof(pkt));
+        if (send_err != ESP_OK) {
+            ESP_LOGE(TAG, "ZONE: esp_now_send error: %s", esp_err_to_name(send_err));
+            if (send_err == ESP_ERR_ESPNOW_NOT_FOUND) {
+                ESP_LOGW(TAG, "ZONE: peer NOT_FOUND — forcing re-add");
+                ensure_gateway_peer(s_control_mac);
+            }
+        }
+    }
+}
+
+/* ========================================================================== */
 /*                               APP MAIN                                     */
 /* ==========================================================================  */
 
@@ -393,7 +648,10 @@ void app_main(void)
      * We reconfigure the interrupt type here to FALLING (active-low button).
      */
     gpio_set_intr_type(soil_config.calibration_button_gpio, GPIO_INTR_NEGEDGE);
-    gpio_install_isr_service(0);
+    ret = gpio_install_isr_service(0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(ret));
+    }
     gpio_isr_handler_add(soil_config.calibration_button_gpio,
                          calibration_button_isr, NULL);
     ESP_LOGI(TAG, "Calibration button ISR installed on GPIO %d.",
@@ -415,20 +673,49 @@ void app_main(void)
         return;
     }
     EspNow_RegisterRecvCb(OnEspNowRecvCb);
+    EspNow_RegisterSendCb(OnEspNowSendCb);
 
     /* --- Zone ID: load from NVS or perform discovery handshake --- */
-    s_zone_id = zone_nvs_load_id();
-    if (s_zone_id != 0) {
-        ESP_LOGI(TAG, "Loaded Zone ID %u from NVS. Skipping discovery.", s_zone_id);
+    s_zone_id = zone_nvs_load_config();
+    ESP_LOGI(TAG, "NVS load: zone_id=%u, MAC=%02X:%02X:%02X:%02X:%02X:%02X, mac_valid=%s",
+             s_zone_id,
+             s_control_mac[0], s_control_mac[1], s_control_mac[2],
+             s_control_mac[3], s_control_mac[4], s_control_mac[5],
+             is_zero_mac(s_control_mac) ? "NO" : "YES");
+
+    if (s_zone_id != 0 && !is_zero_mac(s_control_mac)) {
+        ESP_LOGI(TAG, "MAC validation PASSED — using stored config.");
+        ensure_gateway_peer(s_control_mac);
     } else {
+        if (s_zone_id != 0 && is_zero_mac(s_control_mac)) {
+            ESP_LOGW(TAG, "Invalid stored MAC with zone_id=%u → clearing NVS, forcing discovery", s_zone_id);
+            zone_nvs_clear_config();
+            s_zone_id = 0;
+        } else {
+            ESP_LOGI(TAG, "No stored zone config → starting discovery");
+        }
         zone_perform_discovery();
     }
+
+    /* Final gate: do not proceed unless pairing is fully valid */
+    if (s_zone_id == 0 || is_zero_mac(s_control_mac)) {
+        ESP_LOGE(TAG, "FATAL: Discovery returned without valid pairing — restarting");
+        esp_restart();
+    }
+    ESP_LOGI(TAG, "=== PAIRING CONFIRMED: zone_id=%u  gateway=%02X:%02X:%02X:%02X:%02X:%02X  peer_exist=%s ===",
+             s_zone_id,
+             s_control_mac[0], s_control_mac[1], s_control_mac[2],
+             s_control_mac[3], s_control_mac[4], s_control_mac[5],
+             esp_now_is_peer_exist(s_control_mac) ? "YES" : "NO");
 
     ESP_LOGI(TAG, "Zone ID confirmed: %u. Entering sensor reading loop...", s_zone_id);
 
     /* --- Sensor Reading Loop --- */
     Soil_Moisture_Readings_t soil_readings;
     Temp_DS18B20_Readings_t  temp_readings;
+
+    /* Create the transmission task (highest priority among bg tasks) */
+    xTaskCreate(ZoneTransmissionTask, "zone_tx", 4096, NULL, 5, NULL);
 
     while (1) {
         /* Pause while calibrating */
@@ -442,57 +729,23 @@ void app_main(void)
         (void)Temp_DS18B20_Read(&temp_config, &temp_readings);
 
         if (ret == ESP_OK) {
-            const char *state_str = "UNKNOWN";
-            switch (soil_readings.state) {
-                case SOIL_STATE_DRY:    state_str = "DRY";    break;
-                case SOIL_STATE_NORMAL: state_str = "NORMAL"; break;
-                case SOIL_STATE_WET:    state_str = "WET";    break;
-            }
-
-            char temp_str[16] = "--.-";
-            if (temp_readings.valid) {
-                snprintf(temp_str, sizeof(temp_str), "%.1f", temp_readings.temperature_c);
-            }
+            s_current_sm = soil_readings.moisture_percentage;
+            s_current_temp_valid = temp_readings.valid;
+            s_current_temp = temp_readings.temperature_c;
 
             /* Read flow meter data */
-            float flow_rate = 0.0f;
-            uint32_t total_volume = 0;
-            flow_meter_get_flow_rate(&s_flow_meter, &flow_rate);
-            flow_meter_get_total_volume_ml(&s_flow_meter, &total_volume);
+            flow_meter_get_flow_rate(&s_flow_meter, &s_current_flow);
+            flow_meter_get_total_volume_ml(&s_flow_meter, &s_current_total_vol);
 
-            uint8_t needs_water = (soil_readings.moisture_percentage < SOIL_MOISTURE_WATER_THRESHOLD) ? 1 : 0;
+            s_current_needs_water = (s_current_sm < SOIL_MOISTURE_WATER_THRESHOLD) ? 1 : 0;
 
-            ESP_LOGI(TAG, "[Zone %u] Moisture: %3u%% | Temp: %s C | State: %s | Needs Water: %d",
-                     s_zone_id,
-                     soil_readings.moisture_percentage,
-                     temp_str,
-                     state_str,
-                     needs_water);
-            ESP_LOGI(TAG, "          Flow Rate: %.2f L/min | Total Vol: %lu mL | Valve State: %d",
-                     flow_rate, total_volume, s_valve.state);
-
-            /* Build and send ZONE_DATA packet */
-            EspNow_ZoneDataPayload_t pkt = {0};
-            pkt.header.version   = ESP_NOW_PROTOCOL_VERSION;
-            pkt.header.msg_type  = ESP_NOW_MSG_TYPE_ZONE_DATA;
-            pkt.header.sender_id = s_zone_id;
-
-            pkt.moisture_percentage = soil_readings.moisture_percentage;
-            pkt.temperature_c_x10   = temp_readings.valid
-                                      ? (int16_t)(temp_readings.temperature_c * 10.0f)
-                                      : -999;
-            pkt.needs_water = needs_water;
-            pkt.total_volume_ml = total_volume;
-
-            esp_err_t send_err = EspNow_Send(ESP_NOW_BROADCAST_MAC,
-                                             (const uint8_t *)&pkt, sizeof(pkt));
-            if (send_err != ESP_OK) {
-                ESP_LOGE(TAG, "Send failed: %s", esp_err_to_name(send_err));
-            }
+            ESP_LOGI(TAG, "ZONE: SM=%u TEMP=%.1f", s_current_sm, 
+                     s_current_temp_valid ? s_current_temp : -99.9f);
         } else {
-            ESP_LOGE(TAG, "Sensor read failed: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Sensor read failed: %s (will reuse last known values)", esp_err_to_name(ret));
         }
 
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_READ_INTERVAL_MS));
+        /* Read delay (sensor task keeps running, TX task runs independently every 2s) */
+        vTaskDelay(pdMS_TO_TICKS(SOIL_READ_DELAY_MS));
     }
 }
