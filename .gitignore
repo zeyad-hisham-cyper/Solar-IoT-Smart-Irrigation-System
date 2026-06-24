@@ -93,6 +93,32 @@ app/windows/flutter/ephemeral/
 app/linux/flutter/ephemeral/
 
 # ----------------------------------------------------------------------------
+#  PCB design — KiCad (PCBs/control, PCBs/Zone)
+#  Keep design sources (.kicad_sch/.kicad_pcb/.kicad_pro), gerbers, BoM CSVs,
+#  footprint libraries and rendered images. Ignore generated/local artifacts.
+# ----------------------------------------------------------------------------
+# KiCad timestamped auto-backup archives
+*-backups/
+# KiCad editor autosave files
+_autosave-*
+# per-user local project state (window position / layout)
+*.kicad_prl
+# generated footprint info cache
+fp-info-cache
+# KiCad lock files
+*.lck
+*.kicad_pcb-bak
+*.kicad_sch-bak
+# ERC / DRC reports
+*-erc.rpt
+*-drc.rpt
+# Heavy 3D mesh/solid models (vendor footprint previews — regenerable, not
+# needed for fabrication). Excluded to keep the repo lean.
+*.step
+*.stp
+*.wrl
+
+# ----------------------------------------------------------------------------
 #  Secrets — keep credentials out of version control
 # ----------------------------------------------------------------------------
 *.env

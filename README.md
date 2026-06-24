@@ -33,6 +33,7 @@ field and a phone in your hand. It is built from **three cooperating subsystems*
   - [3.1 Boards & Power](#31-boards--power)
   - [3.2 Complete GPIO Mapping](#32-complete-gpio-mapping)
   - [3.3 Bill of Materials (minimum)](#33-bill-of-materials-minimum)
+  - [3.4 PCB Design (KiCad)](#34-pcb-design-kicad)
 - [4. ESP-NOW Network](#4-esp-now-network)
 - [5. Firmware Design](#5-firmware-design)
   - [5.1 Software Architecture](#51-software-architecture)
@@ -124,6 +125,14 @@ mediated through Firebase Realtime Database.
 ├── README.md                      # ← this document (the single project reference)
 ├── docs/
 │   └── architecture.png           # system architecture diagram
+│
+├── PCBs/                          # KiCad hardware design (gateway + zone boards)
+│   ├── Control Schematic.png      # rendered gateway schematic
+│   ├── control 3D.png             # gateway board 3D render
+│   ├── Zone Schematic.png         # rendered zone schematic
+│   ├── Zone 3D.png                # zone board 3D render
+│   ├── control/                   # GATEWAY KiCad project (.kicad_sch/_pcb/_pro) + BoM csv
+│   └── Zone/                      # ZONE KiCad project + gerbers/ + final_gerber/ + lib/
 │
 ├── firmware/                      # ESP-IDF firmware (two apps + shared components)
 │   ├── db.json                    # authoritative Firebase RTDB schema export
@@ -236,6 +245,29 @@ tactile switches (calibration + reset) · screw terminals.
 **Gateway node:** ESP32-WROOM-32 · motor driver (MOSFET/H-bridge) · AMS1117-3.3 LDO ·
 Schottky freewheeling diodes · bypass/bulk caps · reset switch · screw terminals (pump,
 water-level sensor, power).
+
+### 3.4 PCB Design (KiCad)
+
+Both boards are custom two-layer PCBs designed in **KiCad 8**. The full design sources live in
+[`PCBs/`](PCBs/) — schematics, layouts, fabrication gerbers and the bill-of-materials CSVs are
+all version-controlled, so each board can be reviewed, edited and re-fabricated from this repo.
+
+| Board | KiCad project | Fabrication outputs | BoM |
+|-------|---------------|---------------------|-----|
+| **Gateway / Control** | [`PCBs/control/control.kicad_pro`](PCBs/control/control.kicad_pro) | — | [`control.csv`](PCBs/control/control.csv) |
+| **Zone** | [`PCBs/Zone/Zone.kicad_pro`](PCBs/Zone/Zone.kicad_pro) | [`gerber/`](PCBs/Zone/gerber/), [`final_gerber/`](PCBs/Zone/final_gerber/) | [`Zone.csv`](PCBs/Zone/Zone.csv) |
+
+The zone project bundles its custom symbol/footprint library and the third-party YAAJ **LM2596**
+buck-converter footprint under [`PCBs/Zone/lib/`](PCBs/Zone/lib/). Open a board with
+`File → Open Project` in KiCad and use the 3D viewer to inspect placement and clearances.
+
+| Gateway schematic | Gateway 3D | Zone schematic | Zone 3D |
+|:-----------------:|:----------:|:--------------:|:-------:|
+| ![Gateway schematic](PCBs/Control%20Schematic.png) | ![Gateway 3D](PCBs/control%203D.png) | ![Zone schematic](PCBs/Zone%20Schematic.png) | ![Zone 3D](PCBs/Zone%203D.png) |
+
+> **Repo hygiene:** KiCad auto-backups (`*-backups/`), autosaves, the `fp-info-cache`, per-user
+> `*.kicad_prl` state and the heavy vendor 3D models (`*.step`/`*.wrl`) are git-ignored. The
+> LM2596 STEP/WRL previews are downloadable from the vendor if you want the full 3D render.
 
 ---
 
