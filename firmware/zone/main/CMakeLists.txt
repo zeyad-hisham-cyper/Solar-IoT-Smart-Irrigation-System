@@ -18,4 +18,7 @@ idf_component_register(
         esp_timer
         nvs_flash
         esp_hw_support
+        led_driver
+        buzzer_driver
+        state_machine
 )

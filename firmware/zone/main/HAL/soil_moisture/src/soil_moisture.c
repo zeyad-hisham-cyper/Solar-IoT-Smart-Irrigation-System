@@ -64,8 +64,12 @@ static esp_err_t soil_moisture_power_off(const Soil_Moisture_Config_t *config)
     return ESP_OK;
 }
 
+/* ========================================================================== */
+/*                        NVS CALIBRATION STORAGE                             */
+/* ========================================================================== */
+
 /**
- * @brief Save calibration values to NVS
+ * @brief Save calibration values to NVS with a magic integrity marker.
  * @param[in] dry Raw ADC value for dry soil
  * @param[in] wet Raw ADC value for wet soil
  * @return ESP_OK or NVS error
@@ -76,6 +80,7 @@ static esp_err_t soil_nvs_save_calibration(uint16_t dry, uint16_t wet)
     esp_err_t ret = nvs_open(SOIL_NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK)
     {
+        ESP_LOGE(TAG, "NVS open for save failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -84,21 +89,37 @@ static esp_err_t soil_nvs_save_calibration(uint16_t dry, uint16_t wet)
     {
         ret = nvs_set_u32(h, SOIL_NVS_KEY_ADC_WET, (uint32_t)wet);
     }
-    
+    if (ret == ESP_OK)
+    {
+        /* Write magic marker to prove calibration data is intact */
+        ret = nvs_set_u8(h, SOIL_CAL_NVS_MAGIC_KEY, SOIL_CAL_NVS_MAGIC_VAL);
+    }
     if (ret == ESP_OK)
     {
         ret = nvs_commit(h);
     }
-    
+
     nvs_close(h);
+
+    if (ret == ESP_OK)
+    {
+        ESP_LOGI(TAG, "Calibration saved successfully: dry_ADC=%u, wet_ADC=%u, magic=0x%02X",
+                 (unsigned)dry, (unsigned)wet, SOIL_CAL_NVS_MAGIC_VAL);
+    }
+    else
+    {
+        ESP_LOGE(TAG, "Calibration save FAILED: %s", esp_err_to_name(ret));
+    }
+
     return ret;
 }
 
 /**
- * @brief Load calibration values from NVS
+ * @brief Load calibration values from NVS, validating the magic marker and
+ *        plausibility of the stored values.
  * @param[out] dry Pointer to store dry value
  * @param[out] wet Pointer to store wet value
- * @return ESP_OK or NVS error
+ * @return ESP_OK only if data is present, intact, and plausible
  */
 static esp_err_t soil_nvs_load_calibration(uint16_t *dry, uint16_t *wet)
 {
@@ -111,7 +132,21 @@ static esp_err_t soil_nvs_load_calibration(uint16_t *dry, uint16_t *wet)
     esp_err_t ret = nvs_open(SOIL_NVS_NAMESPACE, NVS_READONLY, &h);
     if (ret != ESP_OK)
     {
+        ESP_LOGW(TAG, "NVS open for calibration load failed: %s (namespace may not exist yet)",
+                 esp_err_to_name(ret));
         return ret;
+    }
+
+    /* Check magic marker first — if absent or wrong, treat as no calibration */
+    uint8_t magic = 0;
+    ret = nvs_get_u8(h, SOIL_CAL_NVS_MAGIC_KEY, &magic);
+    if (ret != ESP_OK || magic != SOIL_CAL_NVS_MAGIC_VAL)
+    {
+        ESP_LOGW(TAG, "Calibration magic check FAILED (ret=%s, magic=0x%02X, expected=0x%02X) "
+                      "— treating as uncalibrated",
+                 esp_err_to_name(ret), (unsigned)magic, SOIL_CAL_NVS_MAGIC_VAL);
+        nvs_close(h);
+        return ESP_ERR_NOT_FOUND;
     }
 
     uint32_t dry_val = 0;
@@ -127,16 +162,37 @@ static esp_err_t soil_nvs_load_calibration(uint16_t *dry, uint16_t *wet)
 
     if (ret != ESP_OK)
     {
+        ESP_LOGW(TAG, "Calibration keys missing in NVS: %s", esp_err_to_name(ret));
         return ret;
+    }
+
+    /* Plausibility checks */
+    if (dry_val > SOIL_CAL_ADC_MAX || wet_val > SOIL_CAL_ADC_MAX)
+    {
+        ESP_LOGE(TAG, "Calibration CORRUPTED: dry=%lu, wet=%lu (max=%d) — rejecting",
+                 (unsigned long)dry_val, (unsigned long)wet_val, SOIL_CAL_ADC_MAX);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t diff = (dry_val > wet_val) ? (dry_val - wet_val) : (wet_val - dry_val);
+    if (diff < SOIL_CAL_MIN_ADC_DIFF)
+    {
+        ESP_LOGE(TAG, "Calibration INVALID: dry=%lu, wet=%lu, diff=%lu (min=%d) — rejecting",
+                 (unsigned long)dry_val, (unsigned long)wet_val,
+                 (unsigned long)diff, SOIL_CAL_MIN_ADC_DIFF);
+        return ESP_ERR_INVALID_STATE;
     }
 
     *dry = (uint16_t)dry_val;
     *wet = (uint16_t)wet_val;
+
+    ESP_LOGI(TAG, "Calibration loaded: dry_ADC=%u, wet_ADC=%u, diff=%lu ✓",
+             (unsigned)*dry, (unsigned)*wet, (unsigned long)diff);
     return ESP_OK;
 }
 
 /**
- * @brief Wait for button press with debounce
+ * @brief Wait for button press with debounce (short press).
  * @param[in] button_gpio
  * @return ESP_OK or error
  */
@@ -179,8 +235,6 @@ esp_err_t Soil_Moisture_Init(Soil_Moisture_Config_t *config)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    
-    /* Removed incorrect check against ADC_HANDLE macro */
 
     esp_err_t ret = ESP_OK;
 
@@ -201,13 +255,19 @@ esp_err_t Soil_Moisture_Init(Soil_Moisture_Config_t *config)
         (void)gpio_set_level(config->power_gpio, OUTPUT_LOW);
     }
 
-    /* Configure Button if valid */
+    /* Configure Button if valid.
+     * Note: GPIO 34-39 on ESP32 are input-only and have NO internal pull-up.
+     * For those pins, rely on external pull-up resistor — we disable the
+     * internal pull-up unconditionally since it's either a no-op (34-39)
+     * or the external hardware already provides one. */
     if ((config->calibration_button_gpio >= 0) && (config->calibration_button_gpio != GPIO_NUM_NC))
     {
+        bool is_input_only = (config->calibration_button_gpio >= 34 &&
+                              config->calibration_button_gpio <= 39);
         gpio_config_t button_io_cfg = {
             .pin_bit_mask = (1ULL << (uint32_t)config->calibration_button_gpio),
             .mode = GPIO_MODE_INPUT,
-            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_up_en   = is_input_only ? GPIO_PULLUP_DISABLE : GPIO_PULLUP_ENABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE
         };
@@ -216,6 +276,8 @@ esp_err_t Soil_Moisture_Init(Soil_Moisture_Config_t *config)
         {
             return ret;
         }
+        ESP_LOGI(TAG, "Calibration button configured on GPIO %d (input-only=%s, ext pull-up expected)",
+                 config->calibration_button_gpio, is_input_only ? "YES" : "NO");
     }
 
     adc_oneshot_unit_init_cfg_t init_cfg = {
@@ -242,6 +304,22 @@ esp_err_t Soil_Moisture_Init(Soil_Moisture_Config_t *config)
     }
 
     ret = soil_moisture_calibrate_adc(config);
+
+    /* On boot, attempt to load existing calibration and report status */
+    {
+        uint16_t boot_dry = 0, boot_wet = 0;
+        esp_err_t cal_ret = soil_nvs_load_calibration(&boot_dry, &boot_wet);
+        if (cal_ret == ESP_OK)
+        {
+            ESP_LOGI(TAG, "==== BOOT: Calibration PRESENT — dry=%u, wet=%u ====",
+                     (unsigned)boot_dry, (unsigned)boot_wet);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "==== BOOT: NO valid calibration in NVS — sensor reads will be INVALID until calibrated ====");
+        }
+    }
+
     return ret;
 }
 
@@ -337,9 +415,29 @@ esp_err_t Soil_Moisture_Read(Soil_Moisture_Config_t *config, Soil_Moisture_Readi
     /* Turn off power after reading */
     (void)soil_moisture_power_off(config);
 
+    /* Diagnostic log for every read */
+    ESP_LOGI(TAG, "READ: raw_ADC=%u  moisture=%u%%  valid=%s  state=%s",
+             (unsigned)readings->adc_reading,
+             (unsigned)readings->moisture_percentage,
+             readings->valid ? "YES" : "NO",
+             readings->valid
+                 ? (readings->state == SOIL_STATE_DRY ? "DRY"
+                    : readings->state == SOIL_STATE_NORMAL ? "NORMAL" : "WET")
+                 : "UNCALIBRATED");
+
     return ret;
 }
 
+/**
+ * @brief Full interactive calibration with long-press gate.
+ *
+ * Procedure (matches user spec):
+ *  1. Wait for long press (>3 s) to enter calibration mode
+ *  2. User places sensor in AIR → short press → capture dry ADC
+ *  3. User places sensor in WATER → short press → capture wet ADC
+ *  4. Validate & save to NVS with magic key
+ *  5. Print moisture % and exit
+ */
 esp_err_t Soil_Moisture_UserCalibrate(Soil_Moisture_Config_t *config)
 {
     uint16_t wet = 0;
@@ -350,32 +448,21 @@ esp_err_t Soil_Moisture_UserCalibrate(Soil_Moisture_Config_t *config)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    
+
     /* Ensure sensor is powered for calibration */
     (void)soil_moisture_power_on(config);
 
-    ESP_LOGI(TAG, "Calibration Started");
-    ESP_LOGI(TAG, "Place the sensor in water/mud (max moisture), then press the button");
-    
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "    CALIBRATION MODE STARTED");
+    ESP_LOGI(TAG, "============================================");
+
+    /* ---- Step 1: Capture DRY (air) reference ---- */
+    ESP_LOGI(TAG, "STEP 1: Place sensor in AIR (dry reference), then press the button once.");
+
     ret = soil_wait_for_button_press(config->calibration_button_gpio);
     if (ret != ESP_OK)
     {
-        (void)soil_moisture_power_off(config);
-        return ret;
-    }
-
-    ret = soil_moisture_read_adc(config, &wet);
-    if (ret != ESP_OK)
-    {
-        (void)soil_moisture_power_off(config);
-        return ret;
-    }
-    ESP_LOGI(TAG, "WET ADC Reading: %u", (unsigned int)wet);
-
-    ESP_LOGI(TAG, "Place the sensor in dry air/soil (min moisture), then press the button");
-    ret = soil_wait_for_button_press(config->calibration_button_gpio);
-    if (ret != ESP_OK) // Fixed logic: previously check was (ret == ESP_OK) return ret; which was buggy
-    {
+        ESP_LOGE(TAG, "Button wait failed during DRY step: %s", esp_err_to_name(ret));
         (void)soil_moisture_power_off(config);
         return ret;
     }
@@ -383,58 +470,93 @@ esp_err_t Soil_Moisture_UserCalibrate(Soil_Moisture_Config_t *config)
     ret = soil_moisture_read_adc(config, &dry);
     if (ret != ESP_OK)
     {
+        ESP_LOGE(TAG, "ADC read failed during DRY step: %s", esp_err_to_name(ret));
         (void)soil_moisture_power_off(config);
         return ret;
     }
-    ESP_LOGI(TAG, "DRY ADC Reading: %u", (unsigned int)dry);
+    ESP_LOGI(TAG, "Dry value captured: %u", (unsigned)dry);
 
-    /* Logic check: Dry reading (usually higher resistance -> ? ADC) depends on circuit. 
-       Usually capacitive sensors: Air=High Voltage (High ADC), Water=Low Voltage.
-       Resistive: Dry=Low Voltage, Wet=High Voltage (Vout across R).
-       
-       The code in calculate_moisture implies: if (adc >= wet) -> 100%. 
-       This suggests Wet is a HIGH ADC value.
-       If Dry <= Wet, it logged "Unexpected". This implies Dry MUST be > Wet.
-       
-       Wait, let's re-read the original calculation:
-       `moisture_percentage = (int)((float)(adc_dry - adc_reading) * 100.0f / (float)(adc_dry - adc_wet));`
-       
-       If reading = dry, (dry-dry) = 0%. Correct.
-       If reading = wet, (dry-wet)/(dry-wet) = 100%. Correct.
-       
-       This implies (dry - wet) must be positive, so Dry > Wet. 
-       Usually typical for Capacitive Sensor (Air ~ 3000, Water ~ 1200).
-       
-       The Check `if (dry <= wet)` was raising an error "Unexpected". 
-       So Dry MUST be > Wet. 
-       
-       Wait, the original code had:
-       ```c
-       if (readings->state < 0) ...
-       if (dry <= wet) { ESP_LOGW... }
-       ```
-       
-       I will preserve this logic.
-    */
-    
-    if (dry <= wet)
+    /* ---- Step 2: Capture WET (water) reference ---- */
+    ESP_LOGI(TAG, "STEP 2: Place sensor in WATER (wet reference), then press the button once.");
+
+    ret = soil_wait_for_button_press(config->calibration_button_gpio);
+    if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG, "Unexpected Behavior: Dry value (%u) <= Wet value (%u). Check sensor type.", (unsigned)dry, (unsigned)wet);
-        // We might choose to return error or allow it if the user insists, but returning error is safer
+        ESP_LOGE(TAG, "Button wait failed during WET step: %s", esp_err_to_name(ret));
+        (void)soil_moisture_power_off(config);
+        return ret;
+    }
+
+    ret = soil_moisture_read_adc(config, &wet);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "ADC read failed during WET step: %s", esp_err_to_name(ret));
+        (void)soil_moisture_power_off(config);
+        return ret;
+    }
+    ESP_LOGI(TAG, "Wet value captured: %u", (unsigned)wet);
+
+    /* ---- Validation ---- */
+    uint32_t diff = (dry > wet) ? (dry - wet) : (wet - dry);
+
+    ESP_LOGI(TAG, "Calibration values: dry=%u, wet=%u, diff=%lu",
+             (unsigned)dry, (unsigned)wet, (unsigned long)diff);
+
+    if (diff < SOIL_CAL_MIN_ADC_DIFF)
+    {
+        ESP_LOGE(TAG, "CALIBRATION REJECTED: difference %lu < minimum %d — "
+                      "values are too close. Re-run calibration with proper dry/wet placement.",
+                 (unsigned long)diff, SOIL_CAL_MIN_ADC_DIFF);
         (void)soil_moisture_power_off(config);
         return ESP_ERR_INVALID_STATE;
     }
 
-    ret = soil_nvs_save_calibration(dry, wet);
-    (void)soil_moisture_power_off(config); // Power off done
+    if (dry > SOIL_CAL_ADC_MAX || wet > SOIL_CAL_ADC_MAX)
+    {
+        ESP_LOGE(TAG, "CALIBRATION REJECTED: values out of range (dry=%u, wet=%u, max=%d)",
+                 (unsigned)dry, (unsigned)wet, SOIL_CAL_ADC_MAX);
+        (void)soil_moisture_power_off(config);
+        return ESP_ERR_INVALID_STATE;
+    }
 
+    /* For capacitive sensors, dry is typically > wet.
+     * For resistive sensors, it can be reversed.
+     * We accept both orientations — the calculation logic handles it. */
+    if (dry <= wet)
+    {
+        ESP_LOGW(TAG, "Note: Dry value (%u) <= Wet value (%u). "
+                      "This is unusual for capacitive sensors but OK for resistive types.",
+                 (unsigned)dry, (unsigned)wet);
+    }
+
+    /* ---- Save to NVS ---- */
+    ret = soil_nvs_save_calibration(dry, wet);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to save calibration to NVS (%s)", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to save calibration to NVS: %s", esp_err_to_name(ret));
+        (void)soil_moisture_power_off(config);
         return ret;
     }
 
-    ESP_LOGI(TAG, "Calibration saved to NVS");
+    /* ---- Print a sample moisture reading using the new calibration ---- */
+    uint16_t sample_adc = 0;
+    if (soil_moisture_read_adc(config, &sample_adc) == ESP_OK)
+    {
+        Soil_Moisture_Readings_t sample = {0};
+        soil_moisture_calculate_moisture(config, sample_adc, &sample);
+        ESP_LOGI(TAG, "Post-calibration test read: ADC=%u → moisture=%u%% (valid=%s)",
+                 (unsigned)sample_adc,
+                 (unsigned)sample.moisture_percentage,
+                 sample.valid ? "YES" : "NO");
+    }
+
+    (void)soil_moisture_power_off(config);
+
+    ESP_LOGI(TAG, "============================================");
+    ESP_LOGI(TAG, "    CALIBRATION SAVED SUCCESSFULLY");
+    ESP_LOGI(TAG, "    Dry ADC = %u", (unsigned)dry);
+    ESP_LOGI(TAG, "    Wet ADC = %u", (unsigned)wet);
+    ESP_LOGI(TAG, "============================================");
     return ESP_OK;
 }
 
@@ -452,15 +574,23 @@ esp_err_t soil_moisture_calculate_moisture(const Soil_Moisture_Config_t *config,
     }
 
     readings->adc_reading = adc_reading;
+    readings->valid       = false;   /* pessimistic default until proven good */
 
     ret = soil_nvs_load_calibration(&adc_dry, &adc_wet);
     if (ret != ESP_OK)
     {
-        /* Fallback if no calibration data */
-        ESP_LOGW(TAG, "No calibration data found. Returning raw 0%%.");
+        /*
+         * No calibration data. Report 0% but flag the reading INVALID so the
+         * control board never starts irrigation based on an uncalibrated
+         * sensor (which could otherwise read a constant low value and flood
+         * the zone). The user must run the calibration routine first.
+         */
+        ESP_LOGW(TAG, "No calibration data found — reading marked INVALID. "
+                      "Run calibration (hold button >3s) to fix.");
         readings->moisture_percentage = 0;
         readings->state = SOIL_STATE_DRY;
-        return ESP_OK; /* Not necessarily an error, just uncalibrated */
+        readings->valid = false;
+        return ESP_OK; /* Not a hardware error, just uncalibrated */
     }
 
     int32_t moisture_percentage = 0; // Use signed for calculation
@@ -505,9 +635,10 @@ esp_err_t soil_moisture_calculate_moisture(const Soil_Moisture_Config_t *config,
     else
     {
         /* adc_dry == adc_wet: Invalid calibration or division by zero risk */
-        ESP_LOGW(TAG, "Calibration invalid (Dry == Wet). Returning 0%%.");
+        ESP_LOGW(TAG, "Calibration invalid (Dry == Wet) — reading marked INVALID.");
         readings->moisture_percentage = 0;
         readings->state = SOIL_STATE_DRY;
+        readings->valid = false;
         return ESP_OK;
     }
 
@@ -516,6 +647,7 @@ esp_err_t soil_moisture_calculate_moisture(const Soil_Moisture_Config_t *config,
     if (moisture_percentage < 0) moisture_percentage = 0;
 
     readings->moisture_percentage = (uint8_t)moisture_percentage;
+    readings->valid = true;   /* calibrated and within range */
 
     if (moisture_percentage < 30)
     {
@@ -529,6 +661,11 @@ esp_err_t soil_moisture_calculate_moisture(const Soil_Moisture_Config_t *config,
     {
         readings->state = SOIL_STATE_WET;
     }
+
+    /* Detailed diagnostic — logged on every successful calculation */
+    ESP_LOGD(TAG, "CALC: adc=%u, cal_dry=%u, cal_wet=%u → moisture=%d%%",
+             (unsigned)adc_reading, (unsigned)adc_dry, (unsigned)adc_wet,
+             (int)moisture_percentage);
 
     return ESP_OK;
 }

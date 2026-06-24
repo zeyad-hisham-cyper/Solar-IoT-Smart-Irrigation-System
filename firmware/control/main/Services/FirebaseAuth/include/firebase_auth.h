@@ -40,6 +40,19 @@ const char *firebase_auth_get_token(void);
  */
 bool firebase_auth_is_logged_in(void);
 
+/**
+ * @brief Get the user's UID parsed from the login response.
+ * @return String pointer containing UID or NULL.
+ */
+const char *firebase_auth_get_uid(void);
+
+/**
+ * @brief Get status of the last auth attempt.
+ */
+int firebase_auth_get_last_status(void);
+esp_err_t firebase_auth_get_last_esp_err(void);
+const char *firebase_auth_get_last_error_desc(void);
+
 #ifdef __cplusplus
 }
 #endif

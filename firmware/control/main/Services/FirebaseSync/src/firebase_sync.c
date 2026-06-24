@@ -16,11 +16,14 @@
 #include "firebase_db.h"
 #include "irrigation_engine.h"
 #include "app_config.h"
+#include "wifi_manager.h"
+#include "esp_wifi.h"
 
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
+#include <sys/time.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -28,6 +31,9 @@
 #include "cJSON.h"
 
 static const char *TAG = "FB_SYNC";
+
+/* Forward declaration */
+static double get_epoch_ms(void);
 
 /* ========================================================================== */
 /*                          SHARED DATA CACHE                                 */
@@ -51,6 +57,25 @@ static uint16_t s_zone_duration[NUM_ZONES]  = { DEFAULT_Z1_DURATION,  DEFAULT_Z2
 /* Zone ID strings for building paths */
 static const char *ZONE_IDS[NUM_ZONES] = { ZONE_ID_1, ZONE_ID_2 };
 
+/* ---- Command acknowledgement queue (engine -> upload task) ---- */
+typedef struct {
+    bool   pending;                              /**< true if an ack awaits upload */
+    char   command_id[FIREBASE_COMMAND_ID_MAX];  /**< id being acknowledged */
+    char   status[16];                           /**< "executed" | "failed" */
+    char   message[64];                          /**< human-readable detail */
+    double executed_at;                          /**< epoch ms when applied */
+} ack_slot_t;
+
+static ack_slot_t      s_ack[NUM_ZONES];
+static portMUX_TYPE    s_ack_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* ---- History bookkeeping (per zone) ---- */
+static double   s_hist_last_time[NUM_ZONES]   = {0};      /**< epoch ms of last record (0 = none yet) */
+static bool     s_hist_valve_last[NUM_ZONES]  = {false};  /**< valve state at last record */
+static bool     s_hist_valve_known[NUM_ZONES] = {false};  /**< valid s_hist_valve_last */
+static uint32_t s_hist_vol_last[NUM_ZONES]    = {0};      /**< cumulative volume at last record (mL) */
+static bool     s_hist_vol_known[NUM_ZONES]   = {false};  /**< valid s_hist_vol_last */
+
 /* ========================================================================== */
 /*                   UPDATE FUNCTIONS (called from main.c)                    */
 /* ========================================================================== */
@@ -58,7 +83,14 @@ static const char *ZONE_IDS[NUM_ZONES] = { ZONE_ID_1, ZONE_ID_2 };
 void firebase_sync_update_zone(int zone_index, const firebase_zone_data_t *data)
 {
     if (zone_index < 0 || zone_index >= NUM_ZONES || data == NULL) return;
+
+    double prev_lu = s_zone_cache[zone_index].last_update;
     s_zone_cache[zone_index] = *data;
+
+    /* Only stamp a real epoch; keep the previous one until SNTP has synced
+     * (get_epoch_ms() returns -1 before time is valid). */
+    double now = get_epoch_ms();
+    s_zone_cache[zone_index].last_update = (now > 0.0) ? now : prev_lu;
     s_zone_cache[zone_index].valid = true;
 }
 
@@ -96,6 +128,34 @@ void firebase_sync_trigger_immediate_upload(void)
     }
 }
 
+void firebase_sync_post_command_ack(int zone_index, const char *command_id,
+                                    const char *status, const char *message)
+{
+    if (zone_index < 0 || zone_index >= NUM_ZONES) return;
+    if (command_id == NULL || status == NULL) return;
+
+    /* Prepare the slot contents off the spinlock, then publish atomically. */
+    ack_slot_t slot = {0};
+    slot.pending = true;
+    strncpy(slot.command_id, command_id, sizeof(slot.command_id) - 1);
+    strncpy(slot.status,     status,     sizeof(slot.status) - 1);
+    if (message != NULL) {
+        strncpy(slot.message, message, sizeof(slot.message) - 1);
+    }
+    double now = get_epoch_ms();
+    slot.executed_at = (now > 0.0) ? now : 0.0;
+
+    portENTER_CRITICAL(&s_ack_mux);
+    s_ack[zone_index] = slot;
+    portEXIT_CRITICAL(&s_ack_mux);
+
+    ESP_LOGI(TAG, "Ack queued for %s: id=%s status=%s",
+             ZONE_IDS[zone_index], command_id, status);
+
+    /* Get it to the cloud promptly. */
+    firebase_sync_trigger_immediate_upload();
+}
+
 /* ========================================================================== */
 /*                      HELPER: RE-AUTH ON 401                                 */
 /* ========================================================================== */
@@ -110,14 +170,17 @@ static esp_err_t try_reauth(void)
 /*                         EPOCH HELPER                                       */
 /* ========================================================================== */
 
-static uint32_t get_epoch(void)
+static double get_epoch_ms(void)
 {
-    time_t now;
-    time(&now);
-    if (now > 1700000000) {
-        return (uint32_t)now;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double ms = (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+    
+    /* 1700000000 sec is ~Nov 2023. In ms: 1700000000000 */
+    if (ms > 1700000000000.0) {
+        return ms;
     }
-    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    return -1.0;
 }
 
 /* ========================================================================== */
@@ -136,7 +199,15 @@ static char *build_gateway_json(void)
     cJSON_AddStringToObject(root, "mode",       s_gateway_mode);
     cJSON_AddBoolToObject(root,   "pump",       s_pump_on);
     cJSON_AddNumberToObject(root, "waterLevel", s_water_level);
-    cJSON_AddNumberToObject(root, "lastSeen",   (double)get_epoch());
+
+    /* Only publish a real epoch timestamp once SNTP has synced.
+     * "lastSeen" and "ts" mirror each other to match the db.json schema
+     * (lastSeen = gateway liveness, ts = last update; both epoch ms). */
+    double epoch = get_epoch_ms();
+    if (epoch > 0.0) {
+        cJSON_AddNumberToObject(root, "lastSeen", epoch);
+        cJSON_AddNumberToObject(root, "ts",       epoch);
+    }
 
     char *str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -159,6 +230,13 @@ static char *build_zone_json(int zone_index)
         have_engine_state = true;
     }
 
+    const firebase_zone_data_t *z = &s_zone_cache[zone_index];
+
+    /* If we have no recent data at all, do not overwrite Firebase with zeros */
+    if (!(have_engine_state && eng_state.data_valid) && !z->valid) {
+        return NULL;
+    }
+
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return NULL;
 
@@ -173,10 +251,9 @@ static char *build_zone_json(int zone_index)
         cJSON_AddNumberToObject(root, "dur",eng_state.duration);
     } else {
         /* Fallback to the zone cache */
-        const firebase_zone_data_t *z = &s_zone_cache[zone_index];
         cJSON_AddNumberToObject(root, "sm", z->soil_moisture);
-        cJSON_AddNumberToObject(root, "t",  z->valid ? z->temperature : 0);
-        cJSON_AddNumberToObject(root, "f",  z->valid ? z->flow_rate   : 0);
+        cJSON_AddNumberToObject(root, "t",  z->temperature);
+        cJSON_AddNumberToObject(root, "f",  z->flow_rate);
         cJSON_AddBoolToObject  (root, "v",  z->valve_open);
 
         int th  = z->threshold > 0 ? z->threshold :
@@ -187,11 +264,214 @@ static char *build_zone_json(int zone_index)
         cJSON_AddNumberToObject(root, "dur", dur);
     }
 
-    cJSON_AddNumberToObject(root, "lu", (double)get_epoch());
+    /* Only publish a real "last updated" epoch once it is valid. */
+    if (s_zone_cache[zone_index].last_update > 0.0) {
+        cJSON_AddNumberToObject(root, "lu", s_zone_cache[zone_index].last_update);
+    }
 
     char *str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     return str;
+}
+
+/**
+ * @brief Build a history record JSON payload for a zone.
+ * @return Heap-allocated string (caller must free), or NULL on error.
+ */
+static char *build_history_json(int zone_index, bool valve_open,
+                                double water_used_liters, double epoch_ms)
+{
+    const firebase_zone_data_t *z = &s_zone_cache[zone_index];
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) return NULL;
+
+    cJSON_AddNumberToObject(root, "temperature",     z->temperature);
+    cJSON_AddNumberToObject(root, "moisture",        z->soil_moisture);
+    cJSON_AddNumberToObject(root, "flowRate",        z->flow_rate);
+    cJSON_AddNumberToObject(root, "waterUsedLiters", water_used_liters);
+    cJSON_AddBoolToObject  (root, "valveOpen",       valve_open);
+    cJSON_AddNumberToObject(root, "timestamp",       epoch_ms);
+    cJSON_AddStringToObject(root, "source",          "gateway");
+
+    char *str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return str;
+}
+
+/**
+ * @brief Resolve a zone's authoritative valve state.
+ */
+static bool zone_valve_is_open(int zone_index)
+{
+    uint8_t zone_id = (uint8_t)(zone_index + 1);
+    irrigation_zone_t eng_state;
+    if (irrigation_engine_get_zone_state(zone_id, &eng_state) == ESP_OK) {
+        return eng_state.valve_open;
+    }
+    return s_zone_cache[zone_index].valve_open;
+}
+
+/**
+ * @brief Write any pending command acknowledgements to /commandAcks/g1/<zone>.
+ *
+ * Runs in the upload task context (HTTP allowed). Snapshots and clears each
+ * pending slot under the spinlock, then performs the network write.
+ */
+static void upload_pending_acks(void)
+{
+    for (int i = 0; i < NUM_ZONES; i++) {
+        ack_slot_t slot;
+
+        portENTER_CRITICAL(&s_ack_mux);
+        slot = s_ack[i];
+        s_ack[i].pending = false;
+        portEXIT_CRITICAL(&s_ack_mux);
+
+        if (!slot.pending) continue;
+
+        cJSON *root = cJSON_CreateObject();
+        if (root == NULL) continue;
+        cJSON_AddStringToObject(root, "commandId",  slot.command_id);
+        cJSON_AddStringToObject(root, "status",     slot.status);
+        cJSON_AddNumberToObject(root, "executedAt", slot.executed_at);
+        cJSON_AddStringToObject(root, "message",    slot.message);
+        char *json = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (json == NULL) continue;
+
+        char path[64];
+        snprintf(path, sizeof(path), "commandAcks/%s/%s", GATEWAY_ID, ZONE_IDS[i]);
+
+        esp_err_t err = firebase_db_put(path, json);
+        if (err == ESP_ERR_INVALID_STATE) {
+            if (try_reauth() == ESP_OK) {
+                err = firebase_db_put(path, json);
+            }
+        }
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Ack written: %s id=%s status=%s",
+                     path, slot.command_id, slot.status);
+        } else {
+            /* Re-queue so we retry on the next cycle (latest ack still wins). */
+            portENTER_CRITICAL(&s_ack_mux);
+            if (!s_ack[i].pending) {
+                s_ack[i] = slot;
+            }
+            portEXIT_CRITICAL(&s_ack_mux);
+            ESP_LOGE(TAG, "Ack write failed for %s — will retry", ZONE_IDS[i]);
+        }
+        free(json);
+    }
+}
+
+/**
+ * @brief Append history records for zones that are due (periodic or on valve change).
+ *
+ * A record is written when either FIREBASE_HISTORY_INTERVAL_MS has elapsed since
+ * the zone's last record, or the zone's valve state changed since then. Records
+ * are only written once SNTP time is valid (timestamps are epoch milliseconds).
+ */
+static void record_history_if_due(void)
+{
+    double epoch = get_epoch_ms();
+    if (epoch <= 0.0) {
+        return; /* No valid time yet — cannot timestamp history. */
+    }
+
+    for (int i = 0; i < NUM_ZONES; i++) {
+        const firebase_zone_data_t *z = &s_zone_cache[i];
+        if (!z->valid) continue; /* Never overwrite/insert without real data. */
+
+        bool valve_open = zone_valve_is_open(i);
+
+        bool first_record  = (s_hist_last_time[i] == 0.0);
+        bool interval_due  = (epoch - s_hist_last_time[i]) >= (double)FIREBASE_HISTORY_INTERVAL_MS;
+        bool valve_changed = s_hist_valve_known[i] && (valve_open != s_hist_valve_last[i]);
+
+        if (!first_record && !interval_due && !valve_changed) {
+            continue;
+        }
+
+        /* waterUsedLiters = delta of cumulative volume since the last record,
+         * clamped to >= 0 so a flow-meter counter reset never goes negative. */
+        double used_liters = 0.0;
+        if (s_hist_vol_known[i] && z->total_volume_ml >= s_hist_vol_last[i]) {
+            used_liters = (double)(z->total_volume_ml - s_hist_vol_last[i]) / 1000.0;
+        }
+
+        char *json = build_history_json(i, valve_open, used_liters, epoch);
+        if (json == NULL) continue;
+
+        char path[64];
+        snprintf(path, sizeof(path), "history/%s", ZONE_IDS[i]);
+
+        esp_err_t err = firebase_db_post(path, json);
+        if (err == ESP_ERR_INVALID_STATE) {
+            if (try_reauth() == ESP_OK) {
+                err = firebase_db_post(path, json);
+            }
+        }
+        free(json);
+
+        if (err == ESP_OK) {
+            /* Advance bookkeeping only on a successful write so we don't lose
+             * the volume baseline or skip the next record on transient failure. */
+            s_hist_last_time[i]   = epoch;
+            s_hist_valve_last[i]  = valve_open;
+            s_hist_valve_known[i] = true;
+            s_hist_vol_last[i]    = z->total_volume_ml;
+            s_hist_vol_known[i]   = true;
+            ESP_LOGI(TAG, "History %s recorded (used=%.3f L, valve=%d)",
+                     ZONE_IDS[i], used_liters, valve_open);
+        } else {
+            ESP_LOGE(TAG, "History %s write failed — will retry next cycle", ZONE_IDS[i]);
+        }
+    }
+}
+
+static void print_firebase_diagnostics(const char *task_name)
+{
+    bool wifi_ok = wifi_manager_is_connected();
+    
+    char ip_str[32] = "N/A";
+    esp_ip4_addr_t ip;
+    if (wifi_manager_get_ip(&ip) == ESP_OK) {
+        snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip));
+    }
+    
+    bool auth_ok = firebase_auth_is_logged_in();
+    const char *token = firebase_auth_get_token();
+    size_t token_len = token ? strlen(token) : 0;
+    const char *uid = firebase_auth_get_uid();
+    
+    int auth_status = firebase_auth_get_last_status();
+    esp_err_t auth_esp_err = firebase_auth_get_last_esp_err();
+    const char *auth_err_desc = firebase_auth_get_last_error_desc();
+    
+    int db_status = firebase_db_get_last_status();
+    esp_err_t db_esp_err = firebase_db_get_last_esp_err();
+    const char *db_err_desc = firebase_db_get_last_error_desc();
+    const char *db_path = firebase_db_get_last_path();
+    
+    ESP_LOGI(TAG, "==== %s DIAGNOSTICS ====", task_name);
+    ESP_LOGI(TAG, "  WiFi State    : %s", wifi_ok ? "CONNECTED" : "DISCONNECTED");
+    ESP_LOGI(TAG, "  IP Address    : %s", ip_str);
+    ESP_LOGI(TAG, "  Firebase Ready: %s", (wifi_ok && auth_ok) ? "YES" : "NO");
+    ESP_LOGI(TAG, "  Token Status  : %s (len: %u)", auth_ok ? "VALID" : "INVALID/MISSING", (unsigned)token_len);
+    ESP_LOGI(TAG, "  User UID      : %s", uid ? uid : "N/A");
+    if (auth_status != 0 || auth_esp_err != ESP_OK || (auth_err_desc && auth_err_desc[0])) {
+        ESP_LOGI(TAG, "  Last Auth Err : %s (HTTP: %d, ESP: %s)", 
+                 (auth_err_desc && auth_err_desc[0]) ? auth_err_desc : "None", 
+                 auth_status, esp_err_to_name(auth_esp_err));
+    }
+    ESP_LOGI(TAG, "  Last DB Path  : %s", (db_path && db_path[0]) ? db_path : "None");
+    if (db_status != 0 || db_esp_err != ESP_OK || (db_err_desc && db_err_desc[0])) {
+        ESP_LOGI(TAG, "  Last DB Error : %s (HTTP: %d, ESP: %s)", 
+                 (db_err_desc && db_err_desc[0]) ? db_err_desc : "None", 
+                 db_status, esp_err_to_name(db_esp_err));
+    }
+    ESP_LOGI(TAG, "=================================");
 }
 
 /* ========================================================================== */
@@ -204,13 +484,31 @@ void firebase_upload_task(void *arg)
     ESP_LOGI(TAG, "Upload task started (interval: %d ms)", FIREBASE_UPLOAD_INTERVAL_MS);
 
     s_upload_task_handle = xTaskGetCurrentTaskHandle();
+    uint32_t loop_count = 0;
 
     while (1) {
         /* Wait for periodic interval or immediate trigger */
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(FIREBASE_UPLOAD_INTERVAL_MS));
+        loop_count++;
 
-        if (!firebase_auth_is_logged_in()) {
-            ESP_LOGW(TAG, "Not logged in — skipping upload");
+        bool wifi_connected = wifi_manager_is_connected();
+        bool logged_in = firebase_auth_is_logged_in();
+
+        if (wifi_connected && !logged_in) {
+            ESP_LOGI(TAG, "WiFi connected but not logged in. Attempting Firebase login...");
+            if (firebase_auth_login() == ESP_OK) {
+                logged_in = true;
+                ESP_LOGI(TAG, "Firebase login succeeded in upload task!");
+            } else {
+                ESP_LOGE(TAG, "Firebase login failed in upload task.");
+            }
+        }
+
+        if (!logged_in) {
+            if (loop_count % 5 == 0) {
+                ESP_LOGW(TAG, "Not logged in — skipping upload");
+                print_firebase_diagnostics("UPLOAD_TASK");
+            }
             continue;
         }
 
@@ -230,6 +528,7 @@ void firebase_upload_task(void *arg)
                 ESP_LOGI(TAG, "Gateway state uploaded");
             } else {
                 ESP_LOGE(TAG, "Gateway upload failed (will retry next cycle)");
+                print_firebase_diagnostics("UPLOAD_TASK");
             }
             free(gw_json);
         }
@@ -251,9 +550,21 @@ void firebase_upload_task(void *arg)
                     ESP_LOGI(TAG, "Zone %s data uploaded", ZONE_IDS[i]);
                 } else {
                     ESP_LOGE(TAG, "Zone %s upload failed", ZONE_IDS[i]);
+                    print_firebase_diagnostics("UPLOAD_TASK");
                 }
                 free(z_json);
             }
+        }
+
+        /* ---- Write any pending command acknowledgements ---- */
+        upload_pending_acks();
+
+        /* ---- Append history records (periodic + on valve change) ---- */
+        record_history_if_due();
+
+        /* Periodically print success diagnostics (every 30 loops / 1 minute) */
+        if (loop_count % 30 == 0) {
+            print_firebase_diagnostics("UPLOAD_TASK");
         }
     }
 }
@@ -291,27 +602,32 @@ static void parse_commands(const char *json_str)
     /* ts */
     cJSON *ts_j = cJSON_GetObjectItem(root, "ts");
     if (cJSON_IsNumber(ts_j)) {
-        s_commands.timestamp = (uint32_t)ts_j->valuedouble;
+        s_commands.timestamp = ts_j->valuedouble;
     }
 
     /* z */
     cJSON *z_obj = cJSON_GetObjectItem(root, "z");
     if (cJSON_IsObject(z_obj)) {
-        /* z1 */
-        cJSON *z1 = cJSON_GetObjectItem(z_obj, ZONE_ID_1);
-        if (cJSON_IsObject(z1)) {
-            cJSON *v = cJSON_GetObjectItem(z1, "v");
-            cJSON *d = cJSON_GetObjectItem(z1, "d");
-            if (cJSON_IsBool(v))   s_commands.zone_valve[0]    = cJSON_IsTrue(v);
-            if (cJSON_IsNumber(d)) s_commands.zone_duration[0] = (uint16_t)d->valuedouble;
-        }
-        /* z2 */
-        cJSON *z2 = cJSON_GetObjectItem(z_obj, ZONE_ID_2);
-        if (cJSON_IsObject(z2)) {
-            cJSON *v = cJSON_GetObjectItem(z2, "v");
-            cJSON *d = cJSON_GetObjectItem(z2, "d");
-            if (cJSON_IsBool(v))   s_commands.zone_valve[1]    = cJSON_IsTrue(v);
-            if (cJSON_IsNumber(d)) s_commands.zone_duration[1] = (uint16_t)d->valuedouble;
+        const char *z_keys[NUM_ZONES] = { ZONE_ID_1, ZONE_ID_2 };
+        for (int i = 0; i < NUM_ZONES; i++) {
+            cJSON *zj = cJSON_GetObjectItem(z_obj, z_keys[i]);
+            if (!cJSON_IsObject(zj)) continue;
+
+            cJSON *v = cJSON_GetObjectItem(zj, "v");
+            cJSON *d = cJSON_GetObjectItem(zj, "d");
+            if (cJSON_IsBool(v))   s_commands.zone_valve[i]    = cJSON_IsTrue(v);
+            if (cJSON_IsNumber(d)) s_commands.zone_duration[i] = (uint16_t)d->valuedouble;
+
+            /* Optional per-zone command id for ack + de-duplication.
+             * Absent id => legacy command (applied, but not acknowledged). */
+            cJSON *cid = cJSON_GetObjectItem(zj, "commandId");
+            if (cJSON_IsString(cid) && cid->valuestring != NULL) {
+                strncpy(s_commands.zone_command_id[i], cid->valuestring,
+                        FIREBASE_COMMAND_ID_MAX - 1);
+                s_commands.zone_command_id[i][FIREBASE_COMMAND_ID_MAX - 1] = '\0';
+            } else {
+                s_commands.zone_command_id[i][0] = '\0';
+            }
         }
     }
 
@@ -389,12 +705,29 @@ void firebase_poll_task(void *arg)
     ESP_LOGI(TAG, "Poll task started (interval: %d ms)", FIREBASE_POLL_INTERVAL_MS);
 
     char resp_buf[FIREBASE_RESPONSE_MAX_LEN];
+    uint32_t loop_count = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(FIREBASE_POLL_INTERVAL_MS));
+        loop_count++;
 
-        if (!firebase_auth_is_logged_in()) {
-            ESP_LOGW(TAG, "Not logged in — skipping poll");
+        bool wifi_connected = wifi_manager_is_connected();
+        bool logged_in = firebase_auth_is_logged_in();
+
+        if (wifi_connected && !logged_in) {
+            ESP_LOGI(TAG, "WiFi connected but not logged in. Attempting Firebase login...");
+            if (firebase_auth_login() == ESP_OK) {
+                logged_in = true;
+                ESP_LOGI(TAG, "Firebase login succeeded in poll task!");
+            } else {
+                ESP_LOGE(TAG, "Firebase login failed in poll task.");
+            }
+        }
+
+        if (!logged_in) {
+            if (loop_count % 5 == 0) {
+                ESP_LOGW(TAG, "Not logged in — skipping poll");
+            }
             continue;
         }
 
@@ -420,6 +753,7 @@ void firebase_poll_task(void *arg)
                 }
             } else {
                 ESP_LOGW(TAG, "Gateway mode poll failed — keeping: %s", s_gateway_mode);
+                print_firebase_diagnostics("POLL_TASK");
             }
         }
 
@@ -438,6 +772,7 @@ void firebase_poll_task(void *arg)
                 parse_zone_config(i, resp_buf);
             } else {
                 ESP_LOGW(TAG, "Zone %s config poll failed — keeping previous", ZONE_IDS[i]);
+                print_firebase_diagnostics("POLL_TASK");
             }
         }
 
@@ -456,7 +791,7 @@ void firebase_poll_task(void *arg)
                 parse_commands(resp_buf);
             } else {
                 ESP_LOGW(TAG, "Command poll failed — keeping previous commands");
-                /* Do NOT invalidate s_commands — keep last known */
+                print_firebase_diagnostics("POLL_TASK");
             }
         }
     }

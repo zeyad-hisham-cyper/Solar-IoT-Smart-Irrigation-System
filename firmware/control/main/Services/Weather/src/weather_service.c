@@ -31,10 +31,12 @@ static const char *TAG = "WEATHER";
 /* ========================================================================== */
 
 static weather_data_t s_weather = {
-    .rainNow= WEATHER_DEFAULT_RAIN,
-    .temp_c = WEATHER_DEFAULT_TEMP,
-    .ts     = 0,
-    .valid  = false,
+    .rainNow  = WEATHER_DEFAULT_RAIN,
+    .temp_c   = WEATHER_DEFAULT_TEMP,
+    .humidity = 0,
+    .condition= "unknown",
+    .ts       = 0,
+    .valid    = false,
 };
 
 /* ========================================================================== */
@@ -162,26 +164,48 @@ esp_err_t weather_service_fetch(weather_data_t *out)
     cJSON *rain_obj = cJSON_GetObjectItem(root, "rain");
     bool is_raining = (rain_obj != NULL);
 
-    /* Temperature: main.temp is in Kelvin */
+    /* Temperature (main.temp is in Kelvin) and humidity (main.humidity, %). */
     float temp_c = WEATHER_DEFAULT_TEMP;
+    int   humidity = 0;
     cJSON *main_obj = cJSON_GetObjectItem(root, "main");
     if (cJSON_IsObject(main_obj)) {
         cJSON *temp_j = cJSON_GetObjectItem(main_obj, "temp");
         if (cJSON_IsNumber(temp_j)) {
             temp_c = (float)temp_j->valuedouble - 273.15f;
         }
+        cJSON *hum_j = cJSON_GetObjectItem(main_obj, "humidity");
+        if (cJSON_IsNumber(hum_j)) {
+            humidity = (int)hum_j->valuedouble;
+        }
+    }
+
+    /* Condition text: weather[0].main (e.g. "Clear", "Rain", "Clouds"). */
+    char condition[24] = "unknown";
+    cJSON *weather_arr = cJSON_GetObjectItem(root, "weather");
+    if (cJSON_IsArray(weather_arr)) {
+        cJSON *w0 = cJSON_GetArrayItem(weather_arr, 0);
+        if (cJSON_IsObject(w0)) {
+            cJSON *cond_j = cJSON_GetObjectItem(w0, "main");
+            if (cJSON_IsString(cond_j) && cond_j->valuestring != NULL) {
+                strncpy(condition, cond_j->valuestring, sizeof(condition) - 1);
+                condition[sizeof(condition) - 1] = '\0';
+            }
+        }
     }
 
     cJSON_Delete(root);
 
     /* Update cache */
-    s_weather.rainNow= is_raining;
-    s_weather.temp_c = temp_c;
-    s_weather.ts     = get_epoch();
-    s_weather.valid  = true;
+    s_weather.rainNow  = is_raining;
+    s_weather.temp_c   = temp_c;
+    s_weather.humidity = humidity;
+    strncpy(s_weather.condition, condition, sizeof(s_weather.condition) - 1);
+    s_weather.condition[sizeof(s_weather.condition) - 1] = '\0';
+    s_weather.ts       = get_epoch();
+    s_weather.valid    = true;
 
-    ESP_LOGI(TAG, "Weather fetched — rain:%s  temp:%.1f°C",
-             is_raining ? "YES" : "NO", temp_c);
+    ESP_LOGI(TAG, "Weather fetched — rain:%s  temp:%.1f°C  humidity:%d%%  condition:%s",
+             is_raining ? "YES" : "NO", temp_c, humidity, condition);
 
     if (out) *out = s_weather;
     return ESP_OK;
@@ -207,9 +231,11 @@ static void upload_weather_to_firebase(void)
     cJSON *root = cJSON_CreateObject();
     if (root == NULL) return;
 
-    cJSON_AddBoolToObject(root, "rainNow", s_weather.rainNow);
-    cJSON_AddNumberToObject(root, "temp", s_weather.temp_c);
-    cJSON_AddNumberToObject(root, "ts", (double)s_weather.ts);
+    /* Schema mirrors db.json: temperature / humidity / condition / timestamp. */
+    cJSON_AddNumberToObject(root, "temperature", s_weather.temp_c);
+    cJSON_AddNumberToObject(root, "humidity",    s_weather.humidity);
+    cJSON_AddStringToObject(root, "condition",   s_weather.condition);
+    cJSON_AddNumberToObject(root, "timestamp",   (double)s_weather.ts);
 
     char *json_str = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

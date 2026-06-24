@@ -5,11 +5,44 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "ESP_NOW_DRIVER";
 
 const uint8_t ESP_NOW_BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+/* ---- Send acknowledgement plumbing (for EspNow_SendReliable) ---- */
+static EspNow_SendCb_t        s_user_send_cb = NULL;  /**< Optional app send cb */
+static SemaphoreHandle_t      s_send_done    = NULL;  /**< Posted by send cb    */
+static volatile esp_now_send_status_t s_last_send_status = ESP_NOW_SEND_FAIL;
+
+/**
+ * @brief Internal ESP-NOW send callback (IDF 5.x signature).
+ *
+ * In ESP-IDF 5.4+ the send callback takes `const wifi_tx_info_t *` instead of a
+ * raw MAC pointer. This adapter extracts the destination MAC (des_addr) and
+ * keeps the application-facing EspNow_SendCb_t (mac_addr, status) signature
+ * stable — mirroring the receive adapter.
+ *
+ * Records the delivery status, unblocks any EspNow_SendReliable() waiter, then
+ * forwards to the application-registered callback (if any). Runs in the Wi-Fi
+ * task context (not an ISR), so the regular FreeRTOS give is correct here.
+ */
+static void esp_now_send_adapter(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
+{
+    const uint8_t *mac_addr = (tx_info != NULL) ? tx_info->des_addr : NULL;
+
+    s_last_send_status = status;
+    if (s_send_done != NULL) {
+        (void)xSemaphoreGive(s_send_done);
+    }
+    if (s_user_send_cb != NULL) {
+        s_user_send_cb(mac_addr, status);
+    }
+}
 
 /* ========================================================================== */
 /*                         INTERNAL RECV ADAPTER                              */
@@ -42,12 +75,13 @@ static void esp_now_recv_adapter(const esp_now_recv_info_t *esp_now_info,
 esp_err_t EspNow_Init(uint8_t channel) {
     esp_err_t err;
 
-    /* Initialize NVS (usually required by Wi-Fi Driver) */
-    err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
+    /*
+     * NVS is NOT initialised here.  The caller (app_main) must call
+     * nvs_flash_init() before EspNow_Init().  The previous code called
+     * nvs_flash_erase() on NVS_NO_FREE_PAGES, which wiped ALL namespaces
+     * — including sensor calibration data — and was the root cause of
+     * persistent calibration loss.
+     */
 
     /* The caller might have already initialized netif and event_loop, so ignore INVALID_STATE */
     err = esp_netif_init();
@@ -105,6 +139,21 @@ esp_err_t EspNow_Init(uint8_t channel) {
     err = esp_now_register_recv_cb(esp_now_recv_adapter);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_now_register_recv_cb failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Create the send-done semaphore and register our internal send callback so
+     * EspNow_SendReliable() can wait for link-layer acknowledgement. */
+    if (s_send_done == NULL) {
+        s_send_done = xSemaphoreCreateBinary();
+        if (s_send_done == NULL) {
+            ESP_LOGE(TAG, "Failed to create send-done semaphore");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    err = esp_now_register_send_cb(esp_now_send_adapter);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_now_register_send_cb failed: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -176,7 +225,10 @@ esp_err_t EspNow_RegisterRecvCb(EspNow_RecvCb_t cb) {
 }
 
 esp_err_t EspNow_RegisterSendCb(EspNow_SendCb_t cb) {
-    return esp_now_register_send_cb((esp_now_send_cb_t)cb);
+    /* Store the app callback; the internal send cb (registered in EspNow_Init)
+     * forwards to it after handling delivery acknowledgement. */
+    s_user_send_cb = cb;
+    return ESP_OK;
 }
 
 esp_err_t EspNow_Send(const uint8_t *mac_addr, const uint8_t *data, size_t data_len) {
@@ -184,4 +236,47 @@ esp_err_t EspNow_Send(const uint8_t *mac_addr, const uint8_t *data, size_t data_
         mac_addr = ESP_NOW_BROADCAST_MAC;
     }
     return esp_now_send(mac_addr, data, data_len);
+}
+
+esp_err_t EspNow_SendReliable(const uint8_t *mac_addr, const uint8_t *data,
+                              size_t data_len, uint8_t max_attempts) {
+    if (mac_addr == NULL || data == NULL || data_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (max_attempts == 0) {
+        max_attempts = 1;
+    }
+    if (s_send_done == NULL) {
+        /* Driver not initialised — fall back to fire-and-forget. */
+        return esp_now_send(mac_addr, data, data_len);
+    }
+
+    esp_err_t last_err = ESP_FAIL;
+
+    for (uint8_t attempt = 0; attempt < max_attempts; attempt++) {
+        /* Clear any stale completion before sending. */
+        (void)xSemaphoreTake(s_send_done, 0);
+
+        last_err = esp_now_send(mac_addr, data, data_len);
+        if (last_err != ESP_OK) {
+            ESP_LOGW(TAG, "send attempt %u/%u enqueue failed: %s",
+                     attempt + 1, max_attempts, esp_err_to_name(last_err));
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        /* Wait up to 100 ms for the link-layer ACK callback. */
+        if (xSemaphoreTake(s_send_done, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (s_last_send_status == ESP_NOW_SEND_SUCCESS) {
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "send attempt %u/%u not acked", attempt + 1, max_attempts);
+        } else {
+            ESP_LOGW(TAG, "send attempt %u/%u timed out", attempt + 1, max_attempts);
+            last_err = ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    return (last_err == ESP_OK) ? ESP_FAIL : last_err;
 }

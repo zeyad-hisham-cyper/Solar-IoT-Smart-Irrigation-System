@@ -59,6 +59,10 @@ extern "C" {
 /** Interval between command polls */
 #define FIREBASE_POLL_INTERVAL_MS       2000
 
+/** Minimum interval between periodic history records per zone.
+ *  History is also written immediately whenever a zone's valve changes. */
+#define FIREBASE_HISTORY_INTERVAL_MS    60000
+
 /* ========================================================================== */
 /*                          HTTP BUFFER SIZES                                 */
 /* ========================================================================== */

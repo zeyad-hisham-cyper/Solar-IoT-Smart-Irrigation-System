@@ -36,14 +36,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_count < WIFI_MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_count++;
-            ESP_LOGI(TAG, "Retrying WiFi connection (%d/%d)...", s_retry_count, WIFI_MAX_RETRY);
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGE(TAG, "WiFi connection failed after %d retries.", WIFI_MAX_RETRY);
+        if (s_wifi_event_group != NULL) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
+        s_retry_count++;
+        ESP_LOGI(TAG, "WiFi disconnected. Retrying connection (%d)...", s_retry_count);
+        esp_wifi_connect();
     }
 }
 
@@ -123,4 +121,22 @@ esp_err_t wifi_manager_wait_connected(uint32_t timeout_ms)
 
     ESP_LOGE(TAG, "WiFi connection timed out.");
     return ESP_ERR_TIMEOUT;
+}
+
+bool wifi_manager_is_connected(void)
+{
+    if (s_wifi_event_group == NULL) return false;
+    return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+}
+
+esp_err_t wifi_manager_get_ip(esp_ip4_addr_t *ip_out)
+{
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == NULL) return ESP_ERR_NOT_SUPPORTED;
+    esp_netif_ip_info_t ip_info;
+    esp_err_t err = esp_netif_get_ip_info(netif, &ip_info);
+    if (err == ESP_OK) {
+        *ip_out = ip_info.ip;
+    }
+    return err;
 }

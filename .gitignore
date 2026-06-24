@@ -1,0 +1,111 @@
+# ============================================================================
+#  Smart Irrigation System — repository .gitignore
+#  Keeps only source, configuration and documentation under version control.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+#  OS / editor cruft
+# ----------------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.directory
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+*.log
+
+# IDE / tooling
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.history
+.clangd/
+.ccls-cache/
+compile_commands.json
+
+# ----------------------------------------------------------------------------
+#  Scratch / working notes & generated concept art (not for publication)
+# ----------------------------------------------------------------------------
+tasks.md
+firmware/main.md
+firmware/final discussion.md
+ChatGPT Image*.png
+Gemini_Generated_Image*.png
+*.scratch
+_scratch/
+
+# ----------------------------------------------------------------------------
+#  Firmware — ESP-IDF (firmware/control, firmware/zone, firmware/common)
+# ----------------------------------------------------------------------------
+**/build/
+build/
+managed_components/
+.espressif/
+sdkconfig
+sdkconfig.old
+flasher_args.json
+*.o
+*.a
+*.out
+*.elf
+*.bin
+*.map
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+
+# ----------------------------------------------------------------------------
+#  Mobile app — Flutter / Dart (app/)
+# ----------------------------------------------------------------------------
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.pub-cache/
+app/.pub/
+app/build/
+app/coverage/
+**/doc/api/
+**/ios/Flutter/.last_build_id
+app.*.symbols
+app.*.map.json
+
+# Flutter platform build artifacts
+app/android/app/debug
+app/android/app/profile
+app/android/app/release
+app/android/.gradle/
+app/ios/Pods/
+app/ios/.symlinks/
+app/macos/Pods/
+app/windows/flutter/ephemeral/
+app/linux/flutter/ephemeral/
+
+# ----------------------------------------------------------------------------
+#  Secrets — keep credentials out of version control
+# ----------------------------------------------------------------------------
+*.env
+.env.*
+google-services.json
+GoogleService-Info.plist
+secrets.h
+
+# ----------------------------------------------------------------------------
+#  Python (ESP-IDF helper venvs, if any)
+# ----------------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/

@@ -25,8 +25,22 @@ extern "C" {
 /**
  * @brief ESP-NOW Protocol Version
  * Increment this version if breaking changes are made to the structures below.
+ *
+ * v4: ZONE_DATA gained `flow_rate_x100`; `moisture_percentage` now uses
+ *     ESP_NOW_MOISTURE_INVALID (0xFF) to signal an unusable/uncalibrated read.
  */
-#define ESP_NOW_PROTOCOL_VERSION 3
+#define ESP_NOW_PROTOCOL_VERSION 4
+
+/**
+ * @brief Sentinel moisture value meaning "no valid reading".
+ *
+ * Sent by a zone when its soil sensor is uncalibrated or the read failed.
+ * The control board treats this as out-of-range and refuses to irrigate on it.
+ */
+#define ESP_NOW_MOISTURE_INVALID  0xFFU
+
+/** @brief Sentinel temperature_c_x10 value meaning "no valid reading". */
+#define ESP_NOW_TEMP_INVALID      ((int16_t)-999)
 
 /**
  * @brief WiFi channel for ESP-NOW communication.
@@ -84,12 +98,13 @@ typedef struct __attribute__((packed)) {
     EspNow_MessageHeader_t header;  /**< Must be first */
 
     /* Current Sensors */
-    uint8_t moisture_percentage;    /**< Soil moisture 0-100% */
-    int16_t temperature_c_x10;      /**< Temperature in Celsius * 10 (e.g., 25.4*10 = 254) */
-    
+    uint8_t moisture_percentage;    /**< Soil moisture 0-100%, or ESP_NOW_MOISTURE_INVALID */
+    int16_t temperature_c_x10;      /**< Temperature in Celsius * 10, or ESP_NOW_TEMP_INVALID */
+
     /* Valve / Flow State */
     uint8_t needs_water;            /**< 1 if zone needs water, 0 otherwise */
     uint32_t total_volume_ml;       /**< Cumulative flow volume in mL */
+    int16_t flow_rate_x100;         /**< Instantaneous flow rate (L/min) * 100 */
 
     /* Future Expansion: Add battery level, ambient light, etc. below */
 } EspNow_ZoneDataPayload_t;
@@ -159,15 +174,15 @@ typedef void (*EspNow_RecvCb_t)(const uint8_t *mac_addr, const uint8_t *data, in
 typedef void (*EspNow_SendCb_t)(const uint8_t *mac_addr, esp_now_send_status_t status);
 
 /**
- * @brief Initializes Wi-Fi (STA mode) and ESP-NOW.
+ * @brief Initialise Wi-Fi (STA mode) and ESP-NOW.
  *
- * This function also provisions the default Broadcast MAC.
+ * Brings up NVS, netif, the default event loop, Wi-Fi in station mode, and the
+ * ESP-NOW layer. Registers an internal receive adapter (IDF 5.x signature) and
+ * an internal send callback used for delivery acknowledgement, then provisions
+ * the broadcast peer.
  *
- * @return
- * @brief Initialize ESP-NOW.
- *
- * @param channel The WiFi channel to use (1-13) or 0 to dynamically track the AP.
- * @return ESP_OK on success or an error code.
+ * @param channel The Wi-Fi channel to use (1-13) or 0 to dynamically track the AP.
+ * @return ESP_OK on success, or an error code.
  */
 esp_err_t EspNow_Init(uint8_t channel);
 
@@ -217,6 +232,24 @@ esp_err_t EspNow_RegisterSendCb(EspNow_SendCb_t cb);
  * @return ESP_OK on success
  */
 esp_err_t EspNow_Send(const uint8_t *mac_addr, const uint8_t *data, size_t data_len);
+
+/**
+ * @brief Send data and wait for the link-layer delivery acknowledgement,
+ *        retransmitting on failure.
+ *
+ * Unlike EspNow_Send() (fire-and-forget), this blocks until the ESP-NOW send
+ * callback reports the result for each attempt. Use it for important unicast
+ * messages such as valve commands. Do NOT use it for broadcast frames (which
+ * always report success) or from within the ESP-NOW receive callback.
+ *
+ * @param[in] mac_addr     Destination unicast MAC (must be a registered peer).
+ * @param[in] data         Payload pointer.
+ * @param[in] data_len     Payload length (<= 250).
+ * @param[in] max_attempts Total attempts including the first (>= 1).
+ * @return ESP_OK if an attempt was acknowledged, ESP_ERR_TIMEOUT/ESP_FAIL otherwise.
+ */
+esp_err_t EspNow_SendReliable(const uint8_t *mac_addr, const uint8_t *data,
+                              size_t data_len, uint8_t max_attempts);
 
 #ifdef __cplusplus
 }

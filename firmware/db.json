@@ -3,8 +3,9 @@
     "g1": {
       "mode": "auto",
       "pump": false,
-      "waterLevel": 0,
-      "lastSeen": 1711111111
+      "waterLevel": 100,
+      "lastSeen": 0,
+      "ts": 0
     }
   },
   "zones": {
@@ -14,7 +15,7 @@
       "t": 0,
       "f": 0,
       "v": false,
-      "lu": 1711111111,
+      "lu": 0,
       "th": 35,
       "dur": 120
     },
@@ -24,30 +25,77 @@
       "t": 0,
       "f": 0,
       "v": false,
-      "lu": 1711111111,
-      "th": 40,
-      "dur": 90
+      "lu": 0,
+      "th": 35,
+      "dur": 120
     }
   },
   "commands": {
     "g1": {
       "pump": false,
+      "ts": 0,
       "z": {
         "z1": {
           "v": false,
-          "d": 0
+          "d": 0,
+          "commandId": "",
+          "requestedAt": 0,
+          "status": ""
         },
         "z2": {
           "v": false,
-          "d": 0
+          "d": 0,
+          "commandId": "",
+          "requestedAt": 0,
+          "status": ""
         }
+      }
+    }
+  },
+  "commandAcks": {
+    "g1": {
+      "z1": {
+        "commandId": "",
+        "status": "pending",
+        "executedAt": 0,
+        "message": ""
       },
-      "ts": 1711111111
+      "z2": {
+        "commandId": "",
+        "status": "pending",
+        "executedAt": 0,
+        "message": ""
+      }
+    }
+  },
+  "history": {
+    "z1": {
+      "sampleReading": {
+        "temperature": 27.3,
+        "moisture": 45,
+        "flowRate": 1.2,
+        "waterUsedLiters": 0.4,
+        "valveOpen": false,
+        "timestamp": 1711111171000,
+        "source": "gateway"
+      }
+    },
+    "z2": {
+      "sampleReading": {
+        "temperature": 26.8,
+        "moisture": 60,
+        "flowRate": 0.8,
+        "waterUsedLiters": 0.2,
+        "valveOpen": false,
+        "timestamp": 1711111171000,
+        "source": "gateway"
+      }
     }
   },
   "weather": {
-    "rainNow": false,
-    "temp": 0,
-    "ts": 1711111111
+    "temperature": 0,
+    "humidity": 0,
+    "condition": "unknown",
+    "timestamp": 0
   }
 }

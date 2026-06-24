@@ -26,7 +26,8 @@
 #include "esp_mac.h"
 #include "esp_now_driver.h"
 #include "app_config.h"
-#include "motor.h"
+#include "pump.h"
+#include "water_level.h"
 
 /* ---- Firebase / WiFi headers ---- */
 #include "wifi_manager.h"
@@ -34,10 +35,16 @@
 #include "firebase_config.h"
 #include "firebase_auth.h"
 #include "firebase_sync.h"
+#include "esp_sntp.h"
 
 /* ---- New modules ---- */
 #include "weather_service.h"
 #include "irrigation_engine.h"
+
+/* ---- Status indicators + lifecycle FSM ---- */
+#include "led_driver.h"
+#include "buzzer_driver.h"
+#include "state_machine.h"
 
 static const char *TAG = "CONTROL_MAIN";
 
@@ -45,8 +52,115 @@ static const char *TAG = "CONTROL_MAIN";
 /*                          GLOBAL ACTUATORS / STATE                          */
 /* ========================================================================== */
 
-/* Pump motor handle — also accessed by irrigation_engine.c via extern */
-motor_t s_pump;
+/* Pump handle — also accessed by irrigation_engine.c via extern */
+pump_t s_pump;
+
+/* Reservoir water-level sensor */
+static water_level_t s_water_level;
+
+/* Status indicators */
+static led_t    s_led_green;
+static led_t    s_led_yellow;
+static led_t    s_led_red;
+static buzzer_t s_buzzer;
+
+/* ========================================================================== */
+/*                       LIFECYCLE STATE MACHINE                              */
+/* ========================================================================== */
+
+typedef enum {
+    CTRL_ST_BOOT = 0,
+    CTRL_ST_INIT,
+    CTRL_ST_INIT_ESPNOW,
+    CTRL_ST_CONNECT_WIFI,
+    CTRL_ST_RUNNING,      /**< Normal operation (idle / serving zones) */
+    CTRL_ST_IRRIGATING,   /**< Pump running */
+    CTRL_ST_TANK_DRY,     /**< Reservoir low — pump inhibited */
+    CTRL_ST_ERROR,        /**< Unrecoverable fault */
+} ctrl_state_t;
+
+static const sm_state_def_t CTRL_STATES[] = {
+    { CTRL_ST_BOOT,         "BOOT"         },
+    { CTRL_ST_INIT,         "INIT"         },
+    { CTRL_ST_INIT_ESPNOW,  "INIT_ESPNOW"  },
+    { CTRL_ST_CONNECT_WIFI, "CONNECT_WIFI" },
+    { CTRL_ST_RUNNING,      "RUNNING"      },
+    { CTRL_ST_IRRIGATING,   "IRRIGATING"   },
+    { CTRL_ST_TANK_DRY,     "TANK_DRY"     },
+    { CTRL_ST_ERROR,        "ERROR"        },
+};
+static sm_t s_sm;
+
+/**
+ * @brief FSM hook: map lifecycle state -> status indicators.
+ */
+static void ctrl_on_state_change(sm_t *sm, sm_state_t from, sm_state_t to, void *user)
+{
+    (void)sm; (void)from; (void)user;
+
+    /* Default: clear the alarm unless we are entering a fault/dry state. */
+    if (to != CTRL_ST_TANK_DRY && to != CTRL_ST_ERROR) {
+        (void)buzzer_stop(&s_buzzer);
+    }
+
+    switch (to) {
+    case CTRL_ST_BOOT:
+    case CTRL_ST_INIT:
+    case CTRL_ST_INIT_ESPNOW:
+        led_off(&s_led_green); led_off(&s_led_red);
+        led_blink(&s_led_yellow, 150, 150, LED_BLINK_FOREVER);   /* fast: booting */
+        break;
+    case CTRL_ST_CONNECT_WIFI:
+        led_off(&s_led_green); led_off(&s_led_red);
+        led_blink(&s_led_yellow, 400, 400, LED_BLINK_FOREVER);   /* slow: connecting */
+        break;
+    case CTRL_ST_RUNNING:
+        led_off(&s_led_yellow); led_off(&s_led_red);
+        led_on(&s_led_green);                                    /* healthy/idle */
+        break;
+    case CTRL_ST_IRRIGATING:
+        led_off(&s_led_green); led_off(&s_led_red);
+        led_on(&s_led_yellow);                                   /* pump running */
+        break;
+    case CTRL_ST_TANK_DRY:
+        led_off(&s_led_green); led_off(&s_led_yellow);
+        led_blink(&s_led_red, 250, 250, LED_BLINK_FOREVER);
+        buzzer_warning(&s_buzzer);
+        break;
+    case CTRL_ST_ERROR:
+        led_off(&s_led_green); led_off(&s_led_yellow);
+        led_on(&s_led_red);
+        buzzer_error(&s_buzzer);
+        break;
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief Initialise LEDs + buzzer and bring up the lifecycle FSM.
+ */
+static void status_indicators_init(void)
+{
+    led_init(&s_led_green,  LED_GREEN_GPIO,  STATUS_LED_ACTIVE_HIGH);
+    led_init(&s_led_yellow, LED_YELLOW_GPIO, STATUS_LED_ACTIVE_HIGH);
+    led_init(&s_led_red,    LED_RED_GPIO,    STATUS_LED_ACTIVE_HIGH);
+
+    buzzer_config_t bz = {
+        .gpio         = BUZZER_GPIO,
+        .active_high  = BUZZER_ACTIVE_HIGH,
+        .use_ledc     = BUZZER_USE_LEDC,
+        .ledc_channel = BUZZER_LEDC_CHANNEL,
+        .ledc_timer   = BUZZER_LEDC_TIMER,
+    };
+    buzzer_init(&s_buzzer, &bz);
+
+    sm_init(&s_sm, CTRL_STATES, sizeof(CTRL_STATES) / sizeof(CTRL_STATES[0]),
+            CTRL_ST_BOOT, "CTRL_FSM");
+    sm_set_on_change(&s_sm, ctrl_on_state_change, NULL);
+    /* Re-apply BOOT indicators (on_change isn't fired for the initial state). */
+    ctrl_on_state_change(&s_sm, CTRL_ST_BOOT, CTRL_ST_BOOT, NULL);
+}
 
 /* ========================================================================== */
 /*                          NVS ZONE REGISTRY                                 */
@@ -239,18 +353,25 @@ void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
         const EspNow_ZoneDataPayload_t *pkt = (const EspNow_ZoneDataPayload_t *)data;
         uint8_t zone_id = header->sender_id;
 
-        float temp_c = (pkt->temperature_c_x10 == -999)
+        float temp_c = (pkt->temperature_c_x10 == ESP_NOW_TEMP_INVALID)
                          ? NAN
                          : (float)pkt->temperature_c_x10 / 10.0f;
 
+        float flow_lpm = (float)pkt->flow_rate_x100 / 100.0f;
+
         ESP_LOGI(TAG, "--- Data from Zone %u ---", zone_id);
-        ESP_LOGI(TAG, "  Moisture   : %u%%", pkt->moisture_percentage);
+        if (pkt->moisture_percentage == ESP_NOW_MOISTURE_INVALID) {
+            ESP_LOGW(TAG, "  Moisture   : INVALID (uncalibrated) — will be ignored");
+        } else {
+            ESP_LOGI(TAG, "  Moisture   : %u%%", pkt->moisture_percentage);
+        }
         if (isnan(temp_c)) {
             ESP_LOGI(TAG, "  Temperature: INVALID");
         } else {
             ESP_LOGI(TAG, "  Temperature: %.1f C", temp_c);
         }
-        ESP_LOGI(TAG, "  Total Vol  : %lu mL", pkt->total_volume_ml);
+        ESP_LOGI(TAG, "  Flow rate  : %.2f L/min", flow_lpm);
+        ESP_LOGI(TAG, "  Total Vol  : %lu mL", (unsigned long)pkt->total_volume_ml);
 
         /* Cache radio MAC for this zone */
         if (zone_id >= 1 && zone_id <= MAX_ZONES) {
@@ -265,9 +386,9 @@ void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
          */
         esp_err_t ret = irrigation_engine_update_zone(
             zone_id,
-            pkt->moisture_percentage,
+            pkt->moisture_percentage,   /* 0xFF sentinel is rejected by the engine */
             temp_c,
-            (float)pkt->total_volume_ml
+            flow_lpm
         );
 
         if (ret != ESP_OK) {
@@ -278,14 +399,15 @@ void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int data_len)
         if (zone_id >= 1 && zone_id <= NUM_ZONES) {
             int fb_idx = zone_id - 1;
             firebase_zone_data_t zd = {
-                .soil_moisture = pkt->moisture_percentage,
-                .temperature   = isnan(temp_c) ? 0 : temp_c,
-                .flow_rate     = 0,
-                .valve_open    = irrigation_engine_is_zone_irrigating(zone_id),
-                .last_update   = 0,  /* Will use epoch in sync task */
-                .threshold     = 0,  /* Engine holds the authoritative values */
-                .duration      = 0,
-                .valid         = true,
+                .soil_moisture   = pkt->moisture_percentage,
+                .temperature     = isnan(temp_c) ? 0 : temp_c,
+                .flow_rate       = flow_lpm,
+                .total_volume_ml = pkt->total_volume_ml,  /* Cumulative — used for history waterUsedLiters */
+                .valve_open      = irrigation_engine_is_zone_irrigating(zone_id),
+                .last_update     = 0,  /* Will use epoch in sync task */
+                .threshold       = 0,  /* Engine holds the authoritative values */
+                .duration        = 0,
+                .valid           = true,
             };
             firebase_sync_update_zone(fb_idx, &zd);
         }
@@ -318,10 +440,51 @@ static void irrigation_cycle_task(void *arg)
     while (1) {
         irrigation_engine_run_cycle();
 
-        /* Keep Firebase in sync with current pump state */
-        firebase_sync_update_gateway(irrigation_engine_is_pump_on(), 0);
+        /* Keep Firebase in sync with current pump state + reservoir level. */
+        bool pump = irrigation_engine_is_pump_on();
+        firebase_sync_update_gateway(pump, irrigation_engine_get_water_level());
+
+        /* Reflect operational state on the status indicators. */
+        if (irrigation_engine_is_tank_dry()) {
+            sm_transition(&s_sm, CTRL_ST_TANK_DRY);
+        } else if (pump) {
+            sm_transition(&s_sm, CTRL_ST_IRRIGATING);
+        } else {
+            sm_transition(&s_sm, CTRL_ST_RUNNING);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(IRRIGATION_CYCLE_INTERVAL_MS));
+    }
+}
+
+/* ========================================================================== */
+/*                        WATER-LEVEL MONITOR TASK                            */
+/* ========================================================================== */
+
+/**
+ * @brief Periodically sample the reservoir level and feed the engine.
+ *
+ * Provides dry-run protection: when the level drops below the threshold the
+ * engine inhibits the pump (see irrigation_engine_set_water_level()).
+ */
+static void water_level_task(void *arg)
+{
+    (void)arg;
+    uint8_t  last_pct = 0;
+    bool     have_valid = false;
+
+    while (1) {
+        uint8_t pct = 0;
+        esp_err_t err = water_level_read(&s_water_level, &pct, NULL);
+        if (err == ESP_OK) {
+            last_pct   = pct;
+            have_valid = true;
+        } else {
+            ESP_LOGW(TAG, "Water-level read failed: %s (keeping last %u%%)",
+                     esp_err_to_name(err), last_pct);
+        }
+        irrigation_engine_set_water_level(last_pct, have_valid);
+        vTaskDelay(pdMS_TO_TICKS(WATER_LEVEL_POLL_INTERVAL_MS));
     }
 }
 
@@ -341,25 +504,43 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* Status indicators + lifecycle FSM (shows BOOT immediately). */
+    status_indicators_init();
+
     /* Load known zones from NVS */
     control_nvs_load_zones();
 
     ESP_LOGI(TAG, "Starting Control Board...");
+    sm_transition(&s_sm, CTRL_ST_INIT);
 
-    /* Initialize Water Pump */
-    s_pump.pin_in_a = MOTOR_PIN_IN_A;
-    s_pump.pin_in_b = MOTOR_PIN_IN_B;
-    if (motor_init(&s_pump) != ESP_OK) {
+    /* Initialize Water Pump (active-LOW switch, forced OFF on boot) */
+    if (pump_init(&s_pump, PUMP_RELAY_GPIO, PUMP_ACTIVE_HIGH) != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize water pump");
+    }
+
+    /* Initialize the reservoir water-level sensor */
+    s_water_level = (water_level_t){
+        .adc_unit     = WATER_LEVEL_ADC_UNIT,
+        .adc_channel  = WATER_LEVEL_ADC_CHANNEL,
+        .adc_atten    = WATER_LEVEL_ADC_ATTEN,
+        .adc_bitwidth = WATER_LEVEL_ADC_BITWIDTH,
+        .samples      = WATER_LEVEL_ADC_SAMPLES,
+        .raw_empty    = WATER_LEVEL_RAW_EMPTY,
+        .raw_full     = WATER_LEVEL_RAW_FULL,
+    };
+    if (water_level_init(&s_water_level) != ESP_OK) {
+        ESP_LOGW(TAG, "Water-level sensor init failed — dry-run protection disabled");
     }
 
     /* Initialize Irrigation Engine */
     irrigation_engine_init();
 
     /* Initialize ESP-NOW */
+    sm_transition(&s_sm, CTRL_ST_INIT_ESPNOW);
     ESP_LOGI(TAG, "Initializing ESP-NOW...");
     if (EspNow_Init(0) != ESP_OK) {
         ESP_LOGE(TAG, "ESP-NOW init failed! Halting.");
+        sm_transition(&s_sm, CTRL_ST_ERROR);
         return;
     }
     EspNow_RegisterRecvCb(OnEspNowRecvCb);
@@ -369,6 +550,14 @@ void app_main(void)
     /*                    WiFi + Firebase Initialization                   */
     /* ================================================================== */
 
+    /* Initialize SNTP to obtain real epoch time (runs in background once connected) */
+    ESP_LOGI(TAG, "Initializing SNTP for background time sync...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+
+    sm_transition(&s_sm, CTRL_ST_CONNECT_WIFI);
     ESP_LOGI(TAG, "Connecting to WiFi AP \"%s\"...", WIFI_SSID);
     if (wifi_manager_init() != ESP_OK) {
         ESP_LOGE(TAG, "WiFi manager init failed");
@@ -376,7 +565,7 @@ void app_main(void)
 
     ret = wifi_manager_wait_connected(30000);  /* 30 second timeout */
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "WiFi connection failed — Firebase and weather will be unavailable");
+        ESP_LOGE(TAG, "WiFi connection failed at boot — Firebase login will retry in background");
         ESP_LOGW(TAG, "Irrigation engine will run with default config and cached weather");
     } else {
         /* Log the WiFi channel — zone boards must scan to align with this */
@@ -404,8 +593,14 @@ void app_main(void)
     xTaskCreate(firebase_poll_task,   "fb_poll",    12288, NULL, 3, NULL);
     xTaskCreate(weather_task,         "weather",     8192, NULL, 3, NULL);
     xTaskCreate(irrigation_cycle_task,"irr_cycle",   4096, NULL, 5, NULL);
+    xTaskCreate(water_level_task,     "water_lvl",   3072, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "All background tasks started.");
+
+    /* Enter normal operation; the irrigation cycle task will refine the state
+     * to IRRIGATING / TANK_DRY as conditions change. */
+    sm_transition(&s_sm, CTRL_ST_RUNNING);
+    buzzer_success(&s_buzzer);
 
     /* ================================================================== */
     /*                        ESP-NOW Discovery Loop                       */

@@ -37,6 +37,11 @@
 #include "valve.h"
 #include "flow_meter.h"
 
+/* Status indicators + lifecycle FSM */
+#include "led_driver.h"
+#include "buzzer_driver.h"
+#include "state_machine.h"
+
 static const char *TAG = "ZONE_APP";
 
 /* ========================================================================== */
@@ -46,21 +51,120 @@ static const char *TAG = "ZONE_APP";
 static valve_t       s_valve;
 static flow_meter_t  s_flow_meter;
 
+/* Status indicators */
+static led_t    s_led_green;
+static led_t    s_led_yellow;
+static led_t    s_led_red;
+static buzzer_t s_buzzer;
+
+/* ========================================================================== */
+/*                       LIFECYCLE STATE MACHINE                              */
+/* ========================================================================== */
+
+typedef enum {
+    ZONE_ST_BOOT = 0,
+    ZONE_ST_INIT,
+    ZONE_ST_DISCOVERY,    /**< Searching for / pairing with the gateway   */
+    ZONE_ST_PAIRED_IDLE,  /**< Paired, valve closed                        */
+    ZONE_ST_IRRIGATING,   /**< Valve open                                  */
+    ZONE_ST_CALIBRATING,  /**< Soil-sensor calibration in progress         */
+    ZONE_ST_ERROR,        /**< Fault (e.g. lost pairing)                   */
+} zone_state_t;
+
+static const sm_state_def_t ZONE_STATES[] = {
+    { ZONE_ST_BOOT,        "BOOT"        },
+    { ZONE_ST_INIT,        "INIT"        },
+    { ZONE_ST_DISCOVERY,   "DISCOVERY"   },
+    { ZONE_ST_PAIRED_IDLE, "PAIRED_IDLE" },
+    { ZONE_ST_IRRIGATING,  "IRRIGATING"  },
+    { ZONE_ST_CALIBRATING, "CALIBRATING" },
+    { ZONE_ST_ERROR,       "ERROR"       },
+};
+static sm_t s_sm;
+
+/** FSM hook: map lifecycle state -> LEDs/buzzer. */
+static void zone_on_state_change(sm_t *sm, sm_state_t from, sm_state_t to, void *user)
+{
+    (void)sm; (void)from; (void)user;
+    switch (to) {
+    case ZONE_ST_BOOT:
+    case ZONE_ST_INIT:
+        led_off(&s_led_green); led_off(&s_led_red);
+        led_blink(&s_led_yellow, 150, 150, LED_BLINK_FOREVER);
+        break;
+    case ZONE_ST_DISCOVERY:
+        led_off(&s_led_green); led_off(&s_led_yellow);
+        led_blink(&s_led_red, 400, 400, LED_BLINK_FOREVER);   /* not paired */
+        break;
+    case ZONE_ST_PAIRED_IDLE:
+        led_off(&s_led_yellow); led_off(&s_led_red);
+        led_on(&s_led_green);
+        break;
+    case ZONE_ST_IRRIGATING:
+        led_off(&s_led_green); led_off(&s_led_red);
+        led_on(&s_led_yellow);
+        break;
+    case ZONE_ST_CALIBRATING:
+        led_off(&s_led_green); led_off(&s_led_red);
+        led_blink(&s_led_yellow, 100, 100, LED_BLINK_FOREVER);
+        break;
+    case ZONE_ST_ERROR:
+        led_off(&s_led_green); led_off(&s_led_yellow);
+        led_on(&s_led_red);
+        buzzer_error(&s_buzzer);
+        break;
+    default:
+        break;
+    }
+}
+
+static void status_indicators_init(void)
+{
+    led_init(&s_led_green,  LED_GREEN_GPIO,  STATUS_LED_ACTIVE_HIGH);
+    led_init(&s_led_yellow, LED_YELLOW_GPIO, STATUS_LED_ACTIVE_HIGH);
+    led_init(&s_led_red,    LED_RED_GPIO,    STATUS_LED_ACTIVE_HIGH);
+
+    buzzer_config_t bz = {
+        .gpio         = BUZZER_GPIO,
+        .active_high  = BUZZER_ACTIVE_HIGH,
+        .use_ledc     = BUZZER_USE_LEDC,
+        .ledc_channel = BUZZER_LEDC_CHANNEL,
+        .ledc_timer   = BUZZER_LEDC_TIMER,
+    };
+    buzzer_init(&s_buzzer, &bz);
+
+    sm_init(&s_sm, ZONE_STATES, sizeof(ZONE_STATES) / sizeof(ZONE_STATES[0]),
+            ZONE_ST_BOOT, "ZONE_FSM");
+    sm_set_on_change(&s_sm, zone_on_state_change, NULL);
+    zone_on_state_change(&s_sm, ZONE_ST_BOOT, ZONE_ST_BOOT, NULL);
+}
+
 
 /* ========================================================================== */
 /*                         NVS ZONE ID STORAGE                                */
 /* ========================================================================== */
 
+/*
+ * IMPORTANT: Pairing data lives in the "zone_cfg" NVS namespace.
+ * Calibration data lives in the "soil_moisture" NVS namespace (managed by the
+ * soil moisture driver).  These MUST stay separate so that communication
+ * recovery never destroys calibration values.
+ */
 #define ZONE_NVS_NAMESPACE  "zone_cfg"
 #define ZONE_NVS_KEY_ID     "zone_id"
 #define ZONE_NVS_KEY_MAC    "ctrl_mac"
+#define ZONE_NVS_KEY_CHAN   "ctrl_chan"  /**< Channel the controller was discovered on */
 
-/** @brief Maximum consecutive send failures before clearing NVS and restarting discovery. */
-#define SEND_FAIL_THRESHOLD  5
+/** @brief Consecutive send failures before soft recovery (channel re-scan). */
+#define SOFT_RECOVERY_THRESHOLD  5
+/** @brief Total consecutive failures (soft + hard) before NVS clear + full re-discovery. */
+#define HARD_RECOVERY_THRESHOLD  10
 
-static uint8_t s_zone_id = 0; /**< 0 means "not yet assigned" */
+static uint8_t s_zone_id = 0;          /**< 0 means "not yet assigned" */
 static uint8_t s_control_mac[6] = {0};
 static int     s_send_fail_count = 0;  /**< Consecutive ESP-NOW send failures */
+static volatile int s_tx_status = -1;  /**< -1 = pending, 0 = success, 1 = fail */
+static uint8_t s_paired_channel = 0;   /**< WiFi channel the controller was discovered on */
 
 /**
  * @brief Check whether a 6-byte MAC address is all zeros (invalid).
@@ -75,15 +179,21 @@ static bool is_zero_mac(const uint8_t mac[6])
 }
 
 /**
- * @brief Erase the stored zone config (zone ID + gateway MAC) from NVS.
+ * @brief Erase the stored zone PAIRING config (zone ID + gateway MAC + channel)
+ *        from NVS. Calibration data is in a DIFFERENT namespace and is NEVER
+ *        touched here.
  */
 static esp_err_t zone_nvs_clear_config(void)
 {
+    ESP_LOGW(TAG, "zone_nvs_clear_config: Erasing PAIRING data only (namespace=\"%s\")", ZONE_NVS_NAMESPACE);
+    ESP_LOGI(TAG, "zone_nvs_clear_config: Calibration data (namespace=\"soil_moisture\") is PRESERVED");
+
     nvs_handle_t h;
     esp_err_t ret = nvs_open(ZONE_NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
     nvs_erase_key(h, ZONE_NVS_KEY_ID);
     nvs_erase_key(h, ZONE_NVS_KEY_MAC);
+    nvs_erase_key(h, ZONE_NVS_KEY_CHAN);
     ret = nvs_commit(h);
     nvs_close(h);
     return ret;
@@ -99,8 +209,15 @@ static esp_err_t zone_nvs_clear_config(void)
  */
 static esp_err_t ensure_gateway_peer(const uint8_t mac[6])
 {
-    ESP_LOGI(TAG, "ensure_gateway_peer: MAC=%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    /* Log current WiFi channel for diagnostics */
+    uint8_t cur_chan = 0;
+    wifi_second_chan_t sec_chan;
+    esp_wifi_get_channel(&cur_chan, &sec_chan);
+
+    ESP_LOGI(TAG, "ensure_gateway_peer: MAC=%02X:%02X:%02X:%02X:%02X:%02X  "
+                  "wifi_chan=%u  paired_chan=%u",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+             (unsigned)cur_chan, (unsigned)s_paired_channel);
 
     if (is_zero_mac(mac)) {
         ESP_LOGE(TAG, "ensure_gateway_peer: REFUSED — MAC is all zeros");
@@ -115,7 +232,7 @@ static esp_err_t ensure_gateway_peer(const uint8_t mac[6])
 
     esp_now_peer_info_t pi = {0};
     memcpy(pi.peer_addr, mac, 6);
-    pi.channel = 0;        /* use current channel */
+    pi.channel = 0;        /* 0 = use current WiFi channel */
     pi.encrypt = false;
     pi.ifidx   = WIFI_IF_STA;
 
@@ -126,13 +243,14 @@ static esp_err_t ensure_gateway_peer(const uint8_t mac[6])
     return add;
 }
 
-static esp_err_t zone_nvs_save_config(uint8_t id, const uint8_t *mac)
+static esp_err_t zone_nvs_save_config(uint8_t id, const uint8_t *mac, uint8_t channel)
 {
     nvs_handle_t h;
     esp_err_t ret = nvs_open(ZONE_NVS_NAMESPACE, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
     ret = nvs_set_u8(h, ZONE_NVS_KEY_ID, id);
     if (ret == ESP_OK) ret = nvs_set_blob(h, ZONE_NVS_KEY_MAC, mac, 6);
+    if (ret == ESP_OK) ret = nvs_set_u8(h, ZONE_NVS_KEY_CHAN, channel);
     if (ret == ESP_OK) ret = nvs_commit(h);
     nvs_close(h);
     return ret;
@@ -142,11 +260,15 @@ static uint8_t zone_nvs_load_config(void)
 {
     nvs_handle_t h;
     if (nvs_open(ZONE_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return 0;
-    
+
     uint8_t id = 0;
     size_t mac_len = 6;
     if (nvs_get_u8(h, ZONE_NVS_KEY_ID, &id) == ESP_OK) {
         if (nvs_get_blob(h, ZONE_NVS_KEY_MAC, s_control_mac, &mac_len) == ESP_OK && mac_len == 6) {
+            /* Load the channel too (default 0 if not stored) */
+            uint8_t chan = 0;
+            nvs_get_u8(h, ZONE_NVS_KEY_CHAN, &chan);
+            s_paired_channel = chan;
             nvs_close(h);
             return id;
         }
@@ -166,8 +288,15 @@ static uint8_t zone_nvs_load_config(void)
 static EventGroupHandle_t  s_discovery_eg = NULL;
 static uint8_t             s_assigned_id  = 0; /**< ID received from control */
 
-/* Current sensor states for the transmission task */
+/*
+ * Current sensor state shared between the sensor reading loop (writer) and the
+ * transmission task (reader). Guarded by a spinlock so the transmission task
+ * always sees a consistent snapshot (previously these multi-field/float reads
+ * could tear).
+ */
+static portMUX_TYPE s_sensor_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t  s_current_sm = 0;
+static bool     s_current_sm_valid = false;   /**< false => moisture unusable (uncalibrated) */
 static float    s_current_temp = 0.0f;
 static bool     s_current_temp_valid = false;
 static float    s_current_flow = 0.0f;
@@ -199,13 +328,21 @@ static void IRAM_ATTR calibration_button_isr(void *arg)
 
 static void OnEspNowSendCb(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
+    /* Grab current channel for diagnostics */
+    uint8_t cur_chan = 0;
+    wifi_second_chan_t sec_chan;
+    esp_wifi_get_channel(&cur_chan, &sec_chan);
+
     if (status == ESP_NOW_SEND_SUCCESS) {
         s_send_fail_count = 0;
-        ESP_LOGI(TAG, "ZONE: send OK (fail counter reset)");
+        s_tx_status = 0;
+        ESP_LOGI(TAG, "ZONE: send OK (fail counter reset)  channel=%u", (unsigned)cur_chan);
     } else {
         s_send_fail_count++;
-        ESP_LOGE(TAG, "ZONE: send FAIL (consecutive failures: %d/%d)",
-                 s_send_fail_count, SEND_FAIL_THRESHOLD);
+        s_tx_status = 1;
+        ESP_LOGE(TAG, "ZONE: send FAIL (%d/%d)  channel=%u  paired_chan=%u",
+                 s_send_fail_count, HARD_RECOVERY_THRESHOLD,
+                 (unsigned)cur_chan, (unsigned)s_paired_channel);
     }
 }
 
@@ -263,13 +400,18 @@ static void OnEspNowRecvCb(const uint8_t *mac_addr, const uint8_t *data, int dat
                 if (cmd->open_valve) {
                     ESP_LOGI(TAG, "==== Command Executing: OPEN VALVE ====");
                     esp_err_t err = valve_open(&s_valve);
-                    if (err != ESP_OK) ESP_LOGE(TAG, "Valve Open Error: %s", esp_err_to_name(err));
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "Valve Open Error: %s", esp_err_to_name(err));
+                    } else {
+                        sm_transition(&s_sm, ZONE_ST_IRRIGATING);
+                    }
                 } else {
                     ESP_LOGI(TAG, "==== Command Executing: CLOSE VALVE ====");
                     esp_err_t err = valve_close(&s_valve);
                     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
                          ESP_LOGW(TAG, "Valve Close Notice: %s", esp_err_to_name(err));
                     }
+                    sm_transition(&s_sm, ZONE_ST_PAIRED_IDLE);
                 }
             } else {
                 ESP_LOGI(TAG, "Command ignored (Target ID %u does not match my ID %u)", cmd->target_zone_id, s_zone_id);
@@ -345,12 +487,13 @@ static void zone_perform_discovery(void)
 
             s_zone_id = s_assigned_id;
             s_send_fail_count = 0;
+            s_paired_channel = current_channel;
 
             /* Register peer with ESP-NOW */
             ensure_gateway_peer(s_control_mac);
 
             /* Save to NVS */
-            esp_err_t err = zone_nvs_save_config(s_zone_id, s_control_mac);
+            esp_err_t err = zone_nvs_save_config(s_zone_id, s_control_mac, s_paired_channel);
             ESP_LOGI(TAG, "NVS save: zone_id=%u MAC=%02X:%02X:%02X:%02X:%02X:%02X result=%s",
                      s_zone_id,
                      s_control_mac[0], s_control_mac[1], s_control_mac[2],
@@ -389,11 +532,12 @@ static void zone_perform_discovery(void)
 
                 s_zone_id = s_assigned_id;
                 s_send_fail_count = 0;
+                s_paired_channel = current_channel;
 
                 /* Re-ensure peer (MAC may have changed between REQ and ASSIGN) */
                 ensure_gateway_peer(s_control_mac);
 
-                esp_err_t save_err = zone_nvs_save_config(s_zone_id, s_control_mac);
+                esp_err_t save_err = zone_nvs_save_config(s_zone_id, s_control_mac, s_paired_channel);
                 ESP_LOGI(TAG, "NVS save: zone_id=%u MAC=%02X:%02X:%02X:%02X:%02X:%02X result=%s",
                          s_zone_id,
                          s_control_mac[0], s_control_mac[1], s_control_mac[2],
@@ -429,47 +573,74 @@ static void CalibrationTask(void *arg)
     Soil_Moisture_Config_t *soil_cfg = (Soil_Moisture_Config_t *)arg;
 
     while (true) {
-        /* Block until button ISR posts the semaphore */
+        /* Block until button ISR posts the semaphore (any press, even short) */
         if (xSemaphoreTake(s_cal_semaphore, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "Calibration triggered by button press!");
 
             /*
              * Disable the GPIO interrupt for the duration of calibration.
              * This prevents extra semaphore posts from button presses that
-             * soil_wait_for_button_press() handles internally via polling,
-             * which would otherwise cause a spurious re-trigger after the
-             * calibration routine returns.
+             * the calibration routine handles internally via polling.
              */
             gpio_isr_handler_remove(soil_cfg->calibration_button_gpio);
+
+            /*
+             * LONG-PRESS GATE: The ISR fires on any falling edge. We now
+             * measure how long the button stays held. If < 3 seconds, this
+             * was an accidental press — ignore it and re-arm the ISR.
+             */
+            ESP_LOGI(TAG, "Button press detected — measuring hold duration...");
+
+            uint32_t hold_ms = 0;
+            const uint32_t poll_ms = 10;
+            const uint32_t long_press_ms = 3000;
+
+            /* The ISR fired on the falling edge, so the button may already
+             * be held low.  Measure until released. */
+            while (gpio_get_level(soil_cfg->calibration_button_gpio) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(poll_ms));
+                hold_ms += poll_ms;
+            }
+
+            if (hold_ms < long_press_ms) {
+                ESP_LOGI(TAG, "Short press (%lu ms < %lu ms) — ignoring.",
+                         (unsigned long)hold_ms, (unsigned long)long_press_ms);
+                /* Drain any stale semaphore counts */
+                while (xSemaphoreTake(s_cal_semaphore, 0) == pdTRUE) { }
+                /* Re-arm ISR */
+                gpio_isr_handler_add(soil_cfg->calibration_button_gpio,
+                                     calibration_button_isr, NULL);
+                continue;
+            }
+
+            ESP_LOGI(TAG, "===== LONG PRESS DETECTED (%lu ms) — ENTERING CALIBRATION MODE =====",
+                     (unsigned long)hold_ms);
+            ESP_LOGI(TAG, "Calibration mode started");
 
             /* Signal reading loop to pause.
              *
              * Wait longer than the worst-case read cycle before taking over
              * the ADC/power GPIO.  Worst case: DS18B20 with 3 retries at
              * 750 ms each (~2.5 s) + ADC samples + margins ≈ 3 s.
-             * Without this, soil_moisture_power_off() from the in-progress
-             * reading-loop iteration can race against us and power the sensor
-             * off while we are mid-calibration-read.
              */
             s_is_calibrating = true;
+            sm_transition(&s_sm, ZONE_ST_CALIBRATING);
             ESP_LOGI(TAG, "Waiting for any active sensor read to finish...");
             vTaskDelay(pdMS_TO_TICKS(3000));
 
             esp_err_t ret = Soil_Moisture_UserCalibrate(soil_cfg);
             if (ret == ESP_OK) {
                 ESP_LOGI(TAG, "Calibration completed successfully. Resuming normal operation.");
+                buzzer_success(&s_buzzer);
             } else {
                 ESP_LOGE(TAG, "Calibration failed: %s. Resuming normal operation.", esp_err_to_name(ret));
+                buzzer_error(&s_buzzer);
             }
 
             /* Resume reading loop */
             s_is_calibrating = false;
+            sm_transition(&s_sm, (s_zone_id != 0) ? ZONE_ST_PAIRED_IDLE : ZONE_ST_DISCOVERY);
 
-            /*
-             * Drain any semaphore counts that accumulated from button presses
-             * during calibration before re-arming the ISR, so we don't
-             * immediately start another calibration cycle.
-             */
+            /* Drain any semaphore counts that accumulated during calibration */
             while (xSemaphoreTake(s_cal_semaphore, 0) == pdTRUE) { /* flush */ }
 
             /* Re-arm the ISR so future presses can trigger calibration again */
@@ -501,6 +672,10 @@ static void ValveSafetyTask(void *arg)
                 ESP_LOGW(TAG, "SAFETY: Valve open for %llu ms (limit=%u ms). Auto-closing!",
                          elapsed_ms, VALVE_TIMEOUT_MS);
                 valve_close(&s_valve);
+                buzzer_warning(&s_buzzer);
+                if (s_zone_id != 0) {
+                    sm_transition(&s_sm, ZONE_ST_PAIRED_IDLE);
+                }
             }
         }
     }
@@ -527,17 +702,90 @@ static void ZoneTransmissionTask(void *arg)
             continue;
         }
 
-        /* ------ Send-fail recovery: too many consecutive failures → re-discover ------ */
-        if (s_send_fail_count >= SEND_FAIL_THRESHOLD) {
-            ESP_LOGW(TAG, "RECOVERY: %d consecutive send failures → clearing NVS and restarting discovery",
+        /* Take a consistent snapshot of the shared sensor state. */
+        uint8_t  sm;
+        bool     sm_valid;
+        float    temp;
+        bool     temp_valid;
+        float    flow;
+        uint32_t total_vol;
+        uint8_t  needs_water;
+        portENTER_CRITICAL(&s_sensor_mux);
+        sm          = s_current_sm;
+        sm_valid    = s_current_sm_valid;
+        temp        = s_current_temp;
+        temp_valid  = s_current_temp_valid;
+        flow        = s_current_flow;
+        total_vol   = s_current_total_vol;
+        needs_water = s_current_needs_water;
+        portEXIT_CRITICAL(&s_sensor_mux);
+
+        /* Build the ZONE_DATA packet using last known good values */
+        EspNow_ZoneDataPayload_t pkt = {0};
+        pkt.header.version   = ESP_NOW_PROTOCOL_VERSION;
+        pkt.header.msg_type  = ESP_NOW_MSG_TYPE_ZONE_DATA;
+        pkt.header.sender_id = s_zone_id;
+
+        pkt.moisture_percentage = sm_valid ? sm : ESP_NOW_MOISTURE_INVALID;
+        pkt.temperature_c_x10   = temp_valid
+                                  ? (int16_t)(temp * 10.0f)
+                                  : ESP_NOW_TEMP_INVALID;
+        pkt.needs_water     = needs_water;
+        pkt.total_volume_ml = total_vol;
+        pkt.flow_rate_x100  = (int16_t)(flow * 100.0f);
+
+        /* ------ Send-fail recovery: too many consecutive failures ------ */
+        if (s_send_fail_count >= HARD_RECOVERY_THRESHOLD) {
+            ESP_LOGW(TAG, "RECOVERY: Hard Recovery threshold reached (%d consecutive send failures) → clearing NVS and restarting full discovery",
                      s_send_fail_count);
             zone_nvs_clear_config();
             memset(s_control_mac, 0, 6);
             s_zone_id = 0;
             s_send_fail_count = 0;
+            s_paired_channel = 0;
+            sm_transition(&s_sm, ZONE_ST_DISCOVERY);
             zone_perform_discovery();
+            sm_transition(&s_sm, ZONE_ST_PAIRED_IDLE);
             ESP_LOGI(TAG, "RECOVERY: discovery complete, resuming transmissions");
             continue;
+        } else if (s_send_fail_count >= SOFT_RECOVERY_THRESHOLD) {
+            ESP_LOGW(TAG, "RECOVERY: Soft Recovery threshold reached (%d consecutive send failures) → scanning channels to re-sync",
+                     s_send_fail_count);
+            
+            bool channel_found = false;
+            uint8_t original_channel = s_paired_channel;
+            
+            for (uint8_t ch = 1; ch <= 13; ch++) {
+                ESP_LOGI(TAG, "RECOVERY: Testing channel %u...", ch);
+                esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+                
+                s_tx_status = -1;
+                esp_err_t send_err = EspNow_Send(s_control_mac, (const uint8_t *)&pkt, sizeof(pkt));
+                if (send_err == ESP_OK) {
+                    /* Wait up to 150ms for callback */
+                    int wait_limit = 15;
+                    while (s_tx_status == -1 && wait_limit > 0) {
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                        wait_limit--;
+                    }
+                    if (s_tx_status == 0) {
+                        s_paired_channel = ch;
+                        zone_nvs_save_config(s_zone_id, s_control_mac, s_paired_channel);
+                        ESP_LOGI(TAG, "RECOVERY: Soft recovery SUCCEEDED on channel %u. Locked and saved.", ch);
+                        channel_found = true;
+                        s_send_fail_count = 0;
+                        break;
+                    }
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            
+            if (!channel_found) {
+                ESP_LOGE(TAG, "RECOVERY: Soft recovery failed on all channels. Restoring original channel %u and continuing to escalate.", original_channel);
+                esp_wifi_set_channel(original_channel, WIFI_SECOND_CHAN_NONE);
+            } else {
+                continue;
+            }
         }
 
         /* Verify peer is registered before every send */
@@ -545,19 +793,6 @@ static void ZoneTransmissionTask(void *arg)
             ESP_LOGW(TAG, "ZONE: peer not in table — re-adding");
             ensure_gateway_peer(s_control_mac);
         }
-
-        /* Build and send ZONE_DATA packet using last known good values */
-        EspNow_ZoneDataPayload_t pkt = {0};
-        pkt.header.version   = ESP_NOW_PROTOCOL_VERSION;
-        pkt.header.msg_type  = ESP_NOW_MSG_TYPE_ZONE_DATA;
-        pkt.header.sender_id = s_zone_id;
-
-        pkt.moisture_percentage = s_current_sm;
-        pkt.temperature_c_x10   = s_current_temp_valid
-                                  ? (int16_t)(s_current_temp * 10.0f)
-                                  : -999;
-        pkt.needs_water = s_current_needs_water;
-        pkt.total_volume_ml = s_current_total_vol;
 
         ESP_LOGI(TAG, "ZONE: TX -> %02X:%02X:%02X:%02X:%02X:%02X  zone_id=%u  SM=%u  fail_cnt=%d",
                  s_control_mac[0], s_control_mac[1], s_control_mac[2],
@@ -592,6 +827,10 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_LOGI(TAG, "Zone Board starting...");
+
+    /* Status indicators + lifecycle FSM (shows BOOT immediately). */
+    status_indicators_init();
+    sm_transition(&s_sm, ZONE_ST_INIT);
 
     /* --- Soil Moisture Sensor --- */
     Soil_Moisture_Config_t soil_config = {
@@ -685,6 +924,10 @@ void app_main(void)
 
     if (s_zone_id != 0 && !is_zero_mac(s_control_mac)) {
         ESP_LOGI(TAG, "MAC validation PASSED — using stored config.");
+        if (s_paired_channel > 0) {
+            esp_wifi_set_channel(s_paired_channel, WIFI_SECOND_CHAN_NONE);
+            ESP_LOGI(TAG, "Restored WiFi channel from NVS: %d", s_paired_channel);
+        }
         ensure_gateway_peer(s_control_mac);
     } else {
         if (s_zone_id != 0 && is_zero_mac(s_control_mac)) {
@@ -694,12 +937,14 @@ void app_main(void)
         } else {
             ESP_LOGI(TAG, "No stored zone config → starting discovery");
         }
+        sm_transition(&s_sm, ZONE_ST_DISCOVERY);
         zone_perform_discovery();
     }
 
     /* Final gate: do not proceed unless pairing is fully valid */
     if (s_zone_id == 0 || is_zero_mac(s_control_mac)) {
         ESP_LOGE(TAG, "FATAL: Discovery returned without valid pairing — restarting");
+        sm_transition(&s_sm, ZONE_ST_ERROR);
         esp_restart();
     }
     ESP_LOGI(TAG, "=== PAIRING CONFIRMED: zone_id=%u  gateway=%02X:%02X:%02X:%02X:%02X:%02X  peer_exist=%s ===",
@@ -709,6 +954,8 @@ void app_main(void)
              esp_now_is_peer_exist(s_control_mac) ? "YES" : "NO");
 
     ESP_LOGI(TAG, "Zone ID confirmed: %u. Entering sensor reading loop...", s_zone_id);
+    sm_transition(&s_sm, ZONE_ST_PAIRED_IDLE);
+    buzzer_success(&s_buzzer);
 
     /* --- Sensor Reading Loop --- */
     Soil_Moisture_Readings_t soil_readings;
@@ -729,18 +976,33 @@ void app_main(void)
         (void)Temp_DS18B20_Read(&temp_config, &temp_readings);
 
         if (ret == ESP_OK) {
-            s_current_sm = soil_readings.moisture_percentage;
-            s_current_temp_valid = temp_readings.valid;
-            s_current_temp = temp_readings.temperature_c;
+            /* Read flow meter into locals (driver writes its own handle). */
+            float    flow = 0.0f;
+            uint32_t vol  = 0;
+            flow_meter_get_flow_rate(&s_flow_meter, &flow);
+            flow_meter_get_total_volume_ml(&s_flow_meter, &vol);
 
-            /* Read flow meter data */
-            flow_meter_get_flow_rate(&s_flow_meter, &s_current_flow);
-            flow_meter_get_total_volume_ml(&s_flow_meter, &s_current_total_vol);
+            /* needs_water is only meaningful when the moisture reading is valid. */
+            uint8_t needs = (soil_readings.valid &&
+                             soil_readings.moisture_percentage < SOIL_MOISTURE_WATER_THRESHOLD)
+                            ? 1 : 0;
 
-            s_current_needs_water = (s_current_sm < SOIL_MOISTURE_WATER_THRESHOLD) ? 1 : 0;
+            /* Publish a consistent snapshot for the transmission task. */
+            portENTER_CRITICAL(&s_sensor_mux);
+            s_current_sm          = soil_readings.moisture_percentage;
+            s_current_sm_valid    = soil_readings.valid;
+            s_current_temp        = temp_readings.temperature_c;
+            s_current_temp_valid  = temp_readings.valid;
+            s_current_flow        = flow;
+            s_current_total_vol   = vol;
+            s_current_needs_water = needs;
+            portEXIT_CRITICAL(&s_sensor_mux);
 
-            ESP_LOGI(TAG, "ZONE: SM=%u TEMP=%.1f", s_current_sm, 
-                     s_current_temp_valid ? s_current_temp : -99.9f);
+            ESP_LOGI(TAG, "ZONE: SM=%u%s TEMP=%.1f FLOW=%.2f L/min",
+                     soil_readings.moisture_percentage,
+                     soil_readings.valid ? "" : "(INVALID)",
+                     temp_readings.valid ? temp_readings.temperature_c : -99.9f,
+                     flow);
         } else {
             ESP_LOGE(TAG, "Sensor read failed: %s (will reuse last known values)", esp_err_to_name(ret));
         }

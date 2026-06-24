@@ -22,6 +22,9 @@
 extern "C" {
 #endif
 
+/** Maximum length of a command id string (Firebase push key / UUID). */
+#define FIREBASE_COMMAND_ID_MAX     40
+
 /* ========================================================================== */
 /*                          ZONE DATA CACHE                                   */
 /* ========================================================================== */
@@ -33,8 +36,9 @@ typedef struct {
     uint8_t  soil_moisture;       /**< 0-100 % */
     float    temperature;         /**< °C (NAN if invalid) */
     float    flow_rate;           /**< L/min */
+    uint32_t total_volume_ml;     /**< Cumulative volume reported by the flow meter (mL) */
     bool     valve_open;          /**< Current valve state */
-    uint32_t last_update;         /**< Epoch seconds (set by uploader if 0) */
+    double   last_update;         /**< Epoch milliseconds (set by uploader if 0) */
     uint8_t  threshold;           /**< Moisture threshold (from config) */
     uint16_t duration;            /**< Default irrigation duration in seconds */
     bool     valid;               /**< true once at least one reading received */
@@ -42,12 +46,19 @@ typedef struct {
 
 /**
  * @brief Cloud command parsed from /commands/g1.
+ *
+ * The legacy "v"/"d" fields are still honoured. An optional per-zone
+ * "commandId" enables de-duplication and acknowledgement: when present and
+ * different from the last applied id, the gateway (re)issues the valve command
+ * and writes /commandAcks/g1/<zone>. An empty id means "no id supplied" and
+ * the command is applied with the legacy behaviour (no ack).
  */
 typedef struct {
     bool     pump;                /**< Desired pump state */
     bool     zone_valve[2];       /**< Desired valve state for z1, z2 */
     uint16_t zone_duration[2];    /**< Command duration for z1, z2 */
-    uint32_t timestamp;           /**< Command timestamp */
+    char     zone_command_id[2][FIREBASE_COMMAND_ID_MAX]; /**< Per-zone command id ("" if none) */
+    double   timestamp;           /**< Command timestamp */
     bool     valid;               /**< true if last poll succeeded */
 } firebase_commands_t;
 
@@ -100,6 +111,22 @@ void firebase_sync_get_zone_config(int zone_index, uint8_t *threshold,
  * @brief Trigger an immediate upload of states (e.g. on critical changes).
  */
 void firebase_sync_trigger_immediate_upload(void);
+
+/**
+ * @brief Queue a command acknowledgement to be written to /commandAcks/g1/<zone>.
+ *
+ * Called by the irrigation engine after it acts on a new commandId. The actual
+ * HTTP write is performed by the upload task, so this function is safe to call
+ * from the engine context (it never blocks on the network). The most recent
+ * pending ack per zone wins if several are queued before the next upload.
+ *
+ * @param zone_index 0-based index (0 = z1, 1 = z2).
+ * @param command_id The command id being acknowledged.
+ * @param status     "executed" or "failed".
+ * @param message    Human-readable detail (may be NULL/empty).
+ */
+void firebase_sync_post_command_ack(int zone_index, const char *command_id,
+                                    const char *status, const char *message);
 
 /* ========================================================================== */
 /*                        FREERTOS TASK FUNCTIONS                             */

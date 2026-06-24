@@ -10,6 +10,8 @@
 #define WIFI_MANAGER_H
 
 #include "esp_err.h"
+#include <stdbool.h>
+#include "esp_netif.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +34,19 @@ esp_err_t wifi_manager_init(void);
  * @return ESP_OK if connected, ESP_ERR_TIMEOUT on timeout
  */
 esp_err_t wifi_manager_wait_connected(uint32_t timeout_ms);
+
+/**
+ * @brief Check if WiFi is currently connected.
+ * @return true if connected with an IP, false otherwise.
+ */
+bool wifi_manager_is_connected(void);
+
+/**
+ * @brief Get the current IP address of the STA interface.
+ * @param[out] ip_out  Pointer to store the IP address.
+ * @return ESP_OK on success.
+ */
+esp_err_t wifi_manager_get_ip(esp_ip4_addr_t *ip_out);
 
 #ifdef __cplusplus
 }

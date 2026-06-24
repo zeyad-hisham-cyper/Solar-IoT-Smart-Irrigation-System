@@ -27,10 +27,12 @@ extern "C" {
  * @brief Cached weather data.
  */
 typedef struct {
-    bool     rainNow;   /**< true if weather indicates rain */
-    float    temp_c;    /**< Temperature in Celsius */
-    uint32_t ts;        /**< Epoch timestamp of last successful fetch */
-    bool     valid;     /**< true once at least one fetch succeeded */
+    bool     rainNow;       /**< true if weather indicates rain (internal decision use) */
+    float    temp_c;        /**< Temperature in Celsius */
+    int      humidity;      /**< Relative humidity % (OpenWeather main.humidity) */
+    char     condition[24]; /**< Short condition text (OpenWeather weather[0].main) */
+    uint32_t ts;            /**< Epoch timestamp of last successful fetch (seconds) */
+    bool     valid;         /**< true once at least one fetch succeeded */
 } weather_data_t;
 
 /* ========================================================================== */

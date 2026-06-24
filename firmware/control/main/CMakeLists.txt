@@ -1,27 +1,30 @@
 idf_component_register(
-    SRCS 
+    SRCS
         "main.c"
-        "HAL/DcMotor/src/motor.c"
+        "HAL/Pump/src/pump.c"
+        "HAL/WaterLevel/src/water_level.c"
         "HAL/WiFi/src/wifi_manager.c"
         "Services/FirebaseAuth/src/firebase_auth.c"
         "Services/FirebaseDB/src/firebase_db.c"
         "Services/FirebaseSync/src/firebase_sync.c"
         "Services/Weather/src/weather_service.c"
         "Services/IrrigationEngine/src/irrigation_engine.c"
-    INCLUDE_DIRS 
+    INCLUDE_DIRS
         "."
         "include"
-        "HAL/DcMotor/include"
+        "HAL/Pump/include"
+        "HAL/WaterLevel/include"
         "HAL/WiFi/include"
         "Services/FirebaseAuth/include"
         "Services/FirebaseDB/include"
         "Services/FirebaseSync/include"
         "Services/Weather/include"
         "Services/IrrigationEngine/include"
-    REQUIRES 
-        esp_now 
+    REQUIRES
+        esp_now
         driver
-        nvs_flash 
+        esp_adc
+        nvs_flash
         esp_hw_support
         esp_http_client
         json
@@ -30,4 +33,7 @@ idf_component_register(
         esp_event
         esp_timer
         esp_wifi
+        led_driver
+        buzzer_driver
+        state_machine
 )

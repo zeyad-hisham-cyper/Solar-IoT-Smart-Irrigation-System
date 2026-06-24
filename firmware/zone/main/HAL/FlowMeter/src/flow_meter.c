@@ -16,21 +16,26 @@
 static const char *TAG = "FLOW_METER";
 
 /** Internal state shared between the ISR and the public API. */
-static volatile uint32_t s_pulse_count  = 0U;  /**< Rising-edge pulse counter (ISR-written) */
-static uint64_t          s_last_call_us = 0U;  /**< Timestamp of the last flow-rate call   */
+static volatile uint32_t s_pulse_total  = 0U;  /**< Cumulative rising-edge count (ISR-written) */
+static uint32_t          s_last_total   = 0U;  /**< Cumulative count at last flow-rate call    */
+static uint64_t          s_last_call_us = 0U;  /**< Timestamp of the last flow-rate call        */
+
+/* Spinlock guarding the shared pulse counters. Unlike portDISABLE_INTERRUPTS(),
+ * a spinlock-based critical section is atomic across BOTH cores. */
+static portMUX_TYPE s_flow_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ========================================================================== */
 /*                              ISR HANDLER                                   */
 /* ========================================================================== */
 
 /**
- * @brief GPIO ISR – increments the pulse counter on every rising edge.
+ * @brief GPIO ISR – increments the cumulative pulse counter on every rising edge.
  *        Runs in IRAM; must be as short as possible.
  */
 static void IRAM_ATTR flow_meter_isr_handler(void *arg)
 {
     (void)arg;
-    s_pulse_count++;
+    s_pulse_total++;
 }
 
 /* ========================================================================== */
@@ -87,7 +92,10 @@ esp_err_t flow_meter_init(flow_meter_t *flow)
     }
 
     /* Clear runtime state */
-    s_pulse_count          = 0U;
+    portENTER_CRITICAL(&s_flow_mux);
+    s_pulse_total = 0U;
+    s_last_total  = 0U;
+    portEXIT_CRITICAL(&s_flow_mux);
     s_last_call_us         = (uint64_t)esp_timer_get_time();
     flow->flow_rate_lpm    = 0.0f;
     flow->total_volume_ml  = 0U;
@@ -111,15 +119,26 @@ esp_err_t flow_meter_get_flow_rate(flow_meter_t *flow, float *flow_rate_lpm)
     esp_err_t ret = flow_check_handle(flow);
     if (ret != ESP_OK) { return ret; }
 
-    /* Snapshot and reset the pulse counter atomically */
-    portDISABLE_INTERRUPTS();
-    uint32_t pulses   = s_pulse_count;
-    s_pulse_count     = 0U;
-    portENABLE_INTERRUPTS();
+    /* Snapshot the cumulative counter atomically (across both cores) */
+    portENTER_CRITICAL(&s_flow_mux);
+    uint32_t total = s_pulse_total;
+    portEXIT_CRITICAL(&s_flow_mux);
+
+    uint32_t pulses      = total - s_last_total;   /* new pulses since last call */
+    s_last_total         = total;
 
     uint64_t now_us      = (uint64_t)esp_timer_get_time();
     uint64_t elapsed_us  = now_us - s_last_call_us;
     s_last_call_us       = now_us;
+
+    /*
+     * Volume is recomputed from the CUMULATIVE pulse count each call, so no
+     * fractional millilitres are ever lost to integer truncation (the old
+     * per-call division dropped the remainder every time). 64-bit math avoids
+     * overflow (uint32 pulses * 1000 would overflow at ~4.3M pulses).
+     */
+    flow->total_volume_ml = (uint32_t)(((uint64_t)total * 1000ULL) /
+                                       (uint64_t)FLOW_METER_PULSES_PER_LITER);
 
     /* Guard against division by zero on very first call */
     if (elapsed_us == 0U)
@@ -138,9 +157,6 @@ esp_err_t flow_meter_get_flow_rate(flow_meter_t *flow, float *flow_rate_lpm)
                           ((float)FLOW_METER_PULSES_PER_LITER * elapsed_s);
 
     flow->flow_rate_lpm = rate_lpm;
-
-    /* Accumulate volume: volume_mL = (pulses / PULSES_PER_LITER) * 1000 */
-    flow->total_volume_ml += (uint32_t)((pulses * 1000U) / FLOW_METER_PULSES_PER_LITER);
 
     ESP_LOGD(TAG, "Pulses=%"PRIu32"  elapsed=%.2f s  rate=%.2f L/min  total=%"PRIu32" mL",
              pulses, elapsed_s, rate_lpm, flow->total_volume_ml);
@@ -175,9 +191,10 @@ esp_err_t flow_meter_reset(flow_meter_t *flow)
     esp_err_t ret = flow_check_handle(flow);
     if (ret != ESP_OK) { return ret; }
 
-    portDISABLE_INTERRUPTS();
-    s_pulse_count = 0U;
-    portENABLE_INTERRUPTS();
+    portENTER_CRITICAL(&s_flow_mux);
+    s_pulse_total = 0U;
+    s_last_total  = 0U;
+    portEXIT_CRITICAL(&s_flow_mux);
 
     flow->total_volume_ml = 0U;
     flow->flow_rate_lpm   = 0.0f;
@@ -200,9 +217,10 @@ esp_err_t flow_meter_deinit(flow_meter_t *flow)
     gpio_isr_handler_remove(flow->signal_pin);
     gpio_reset_pin(flow->signal_pin);
 
-    portDISABLE_INTERRUPTS();
-    s_pulse_count = 0U;
-    portENABLE_INTERRUPTS();
+    portENTER_CRITICAL(&s_flow_mux);
+    s_pulse_total = 0U;
+    s_last_total  = 0U;
+    portEXIT_CRITICAL(&s_flow_mux);
 
     flow->flow_rate_lpm   = 0.0f;
     flow->total_volume_ml = 0U;

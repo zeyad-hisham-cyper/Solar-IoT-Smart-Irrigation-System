@@ -13,10 +13,11 @@
 #include "firebase_sync.h"
 #include "firebase_config.h"
 #include "app_config.h"
-#include "motor.h"
+#include "pump.h"
 #include "esp_now_driver.h"
 
 #include <string.h>
+#include <stdio.h>
 #include <math.h>
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -30,10 +31,13 @@ static const char *TAG = "IRR_ENGINE";
 /*                          EXTERNAL REFERENCES                               */
 /* ========================================================================== */
 
-/* Pump motor handle and zone radio MACs are owned by main.c */
-extern motor_t  s_pump;
+/* Pump handle and zone radio MACs are owned by main.c */
+extern pump_t   s_pump;
 extern uint8_t  s_zone_radio_mac[][6];
 extern bool     s_zone_radio_mac_valid[];
+
+/* Number of reliable-send attempts for valve commands (ACK + retransmit). */
+#define VALVE_CMD_ATTEMPTS  4
 
 /* ========================================================================== */
 /*                          INTERNAL STATE                                    */
@@ -44,10 +48,18 @@ static irrigation_mode_t  s_mode = IRRIGATION_MODE_AUTO;
 static bool               s_pump_on = false;
 static SemaphoreHandle_t  s_mutex = NULL;
 
+/* Reservoir water level (fed by the water-level task in main.c). */
+static uint8_t            s_water_level_pct  = 0;
+static bool               s_water_level_valid = false;
+static bool               s_tank_dry          = false;
+
 /** Per-zone irrigation tracking (parallel — multiple zones can irrigate) */
 static bool      s_zone_irrigating[NUM_ZONES] = {false};
 static TickType_t s_zone_irr_start[NUM_ZONES]  = {0};
 static TickType_t s_zone_irr_duration[NUM_ZONES] = {0};
+
+/** Last manual command id applied per zone (for de-duplication + acks). */
+static char      s_zone_last_cmd_id[NUM_ZONES][FIREBASE_COMMAND_ID_MAX] = {{0}};
 
 /* ========================================================================== */
 /*                     MUTEX HELPERS                                          */
@@ -72,13 +84,29 @@ static bool any_zone_irrigating(void)
 }
 
 /**
- * @brief Turn the pump ON if not already running.
+ * @brief Whether there is enough water in the reservoir to run the pump.
+ *
+ * Returns false only when we have a VALID level reading below the dry
+ * threshold. If no valid reading exists yet (sensor absent/failed), we allow
+ * operation but the caller logs a warning — this keeps installations without a
+ * level sensor functional while still protecting tanks that do have one.
  */
-static void pump_on(void)
+static bool water_available(void)
+{
+    if (s_water_level_valid && s_water_level_pct < WATER_LEVEL_DRY_THRESHOLD) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief Turn the pump ON if not already running and water is available.
+ */
+static void engine_pump_on(void)
 {
     if (!s_pump_on) {
         ESP_LOGI(TAG, ">>> PUMP ON");
-        motor_rotate(&s_pump, MOTOR_DIR_CW, MOTOR_SPEED_MAX);
+        pump_on(&s_pump);
         s_pump_on = true;
         firebase_sync_trigger_immediate_upload();
         /* Small delay to let pressure build */
@@ -93,7 +121,7 @@ static void pump_off_if_idle(void)
 {
     if (s_pump_on && !any_zone_irrigating()) {
         ESP_LOGI(TAG, ">>> PUMP OFF (no active zones)");
-        motor_stop(&s_pump);
+        pump_off(&s_pump);
         s_pump_on = false;
         firebase_sync_trigger_immediate_upload();
     }
@@ -108,13 +136,15 @@ static void pump_off_if_idle(void)
  *
  * @param zone_id     1-based zone ID.
  * @param open_valve  true to open, false to close.
+ * @return ESP_OK if the zone acknowledged the reliable send, otherwise the
+ *         underlying error (used to populate command acknowledgements).
  */
-static void send_valve_command(uint8_t zone_id, bool open_valve)
+static esp_err_t send_valve_command(uint8_t zone_id, bool open_valve)
 {
-    if (zone_id < 1 || zone_id > MAX_ZONES) return;
+    if (zone_id < 1 || zone_id > MAX_ZONES) return ESP_ERR_INVALID_ARG;
     if (!s_zone_radio_mac_valid[zone_id]) {
         ESP_LOGW(TAG, "Zone %u radio MAC unknown — cannot send valve cmd", zone_id);
-        return;
+        return ESP_ERR_INVALID_STATE;
     }
 
     EspNow_AddPeer(s_zone_radio_mac[zone_id]);
@@ -126,15 +156,20 @@ static void send_valve_command(uint8_t zone_id, bool open_valve)
     cmd.target_zone_id   = zone_id;
     cmd.open_valve       = open_valve ? 1 : 0;
 
-    esp_err_t err = EspNow_Send(s_zone_radio_mac[zone_id],
-                                 (const uint8_t *)&cmd, sizeof(cmd));
+    /* Valve commands are safety-critical — send reliably with ACK + retransmit
+     * rather than fire-and-forget, so a dropped frame doesn't leave a valve in
+     * the wrong state until the zone's 10-minute safety timeout. */
+    esp_err_t err = EspNow_SendReliable(s_zone_radio_mac[zone_id],
+                                        (const uint8_t *)&cmd, sizeof(cmd),
+                                        VALVE_CMD_ATTEMPTS);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Valve CMD -> Zone %u: %s", zone_id,
+        ESP_LOGI(TAG, "Valve CMD -> Zone %u: %s (acked)", zone_id,
                  open_valve ? "OPEN" : "CLOSE");
     } else {
-        ESP_LOGE(TAG, "Valve CMD send failed for Zone %u: %s",
+        ESP_LOGE(TAG, "Valve CMD NOT acked for Zone %u: %s (will be retried next cycle)",
                  zone_id, esp_err_to_name(err));
     }
+    return err;
 }
 
 /* ========================================================================== */
@@ -149,26 +184,40 @@ static void send_valve_command(uint8_t zone_id, bool open_valve)
  *
  * @param zone_id   1-based zone ID.
  * @param duration  Duration in seconds.
+ * @return ESP_OK if the valve command was acknowledged (or the zone was already
+ *         irrigating), ESP_ERR_INVALID_STATE if safety blocked the start, or the
+ *         ESP-NOW error if the reliable send was not acknowledged.
  */
-static void start_irrigation(uint8_t zone_id, uint16_t duration)
+static esp_err_t start_irrigation(uint8_t zone_id, uint16_t duration)
 {
-    if (zone_id < 1 || zone_id > NUM_ZONES) return;
+    if (zone_id < 1 || zone_id > NUM_ZONES) return ESP_ERR_INVALID_ARG;
     int idx = zone_id - 1;
 
     /* Already irrigating? Skip. */
-    if (s_zone_irrigating[idx]) return;
+    if (s_zone_irrigating[idx]) return ESP_OK;
 
     /* Safety: never irrigate if moisture is above threshold */
     if (s_zones[idx].sm >= s_zones[idx].threshold) {
         ESP_LOGW(TAG, "Zone %u sm=%u >= th=%u — safety limit, skipping",
                  zone_id, s_zones[idx].sm, s_zones[idx].threshold);
-        return;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Safety: never run the pump dry. */
+    if (!water_available()) {
+        ESP_LOGW(TAG, "Zone %u: reservoir low (%u%% < %d%%) — irrigation inhibited",
+                 zone_id, s_water_level_pct, WATER_LEVEL_DRY_THRESHOLD);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_water_level_valid) {
+        ESP_LOGW(TAG, "Zone %u: no valid water-level reading — proceeding without dry-run protection",
+                 zone_id);
     }
 
     ESP_LOGI(TAG, "Starting irrigation: Zone %u for %u seconds", zone_id, duration);
 
     /* 1. Pump ON first */
-    pump_on();
+    engine_pump_on();
 
     /* 2. Open valve */
     s_zone_irrigating[idx] = true;
@@ -176,24 +225,28 @@ static void start_irrigation(uint8_t zone_id, uint16_t duration)
     s_zone_irr_start[idx] = xTaskGetTickCount();
     s_zone_irr_duration[idx] = pdMS_TO_TICKS((uint32_t)duration * 1000UL);
 
-    send_valve_command(zone_id, true);
+    esp_err_t send_res = send_valve_command(zone_id, true);
 
     /* Update Firebase with current state */
     firebase_sync_update_gateway(s_pump_on, 0);
     firebase_sync_trigger_immediate_upload();
+
+    return send_res;
 }
 
 /**
  * @brief Stop irrigating a specific zone.
  *
  * @param zone_id  1-based zone ID.
+ * @return ESP_OK if the close command was acknowledged (or the zone was already
+ *         idle), otherwise the ESP-NOW error from the reliable send.
  */
-static void stop_zone_irrigation(uint8_t zone_id)
+static esp_err_t stop_zone_irrigation(uint8_t zone_id)
 {
-    if (zone_id < 1 || zone_id > NUM_ZONES) return;
+    if (zone_id < 1 || zone_id > NUM_ZONES) return ESP_ERR_INVALID_ARG;
     int idx = zone_id - 1;
 
-    if (!s_zone_irrigating[idx]) return;
+    if (!s_zone_irrigating[idx]) return ESP_OK;
 
     ESP_LOGI(TAG, "Stopping irrigation: Zone %u", zone_id);
 
@@ -203,7 +256,7 @@ static void stop_zone_irrigation(uint8_t zone_id)
     s_zone_irr_start[idx] = 0;
     s_zone_irr_duration[idx] = 0;
 
-    send_valve_command(zone_id, false);
+    esp_err_t send_res = send_valve_command(zone_id, false);
 
     /* 2. Pump OFF if no other zone is active */
     pump_off_if_idle();
@@ -211,6 +264,8 @@ static void stop_zone_irrigation(uint8_t zone_id)
     /* Update Firebase */
     firebase_sync_update_gateway(s_pump_on, 0);
     firebase_sync_trigger_immediate_upload();
+
+    return send_res;
 }
 
 /**
@@ -278,6 +333,7 @@ static void check_irrigation_durations(void)
 {
     for (int i = 0; i < NUM_ZONES; i++) {
         if (!s_zone_irrigating[i]) continue;
+        if (s_zone_irr_duration[i] == 0) continue; /* 0 means infinite duration (sensor-driven) */
 
         TickType_t elapsed = xTaskGetTickCount() - s_zone_irr_start[i];
         if (elapsed >= s_zone_irr_duration[i]) {
@@ -307,17 +363,31 @@ static void run_auto_mode(void)
     for (int i = 0; i < NUM_ZONES; i++) {
         uint8_t zone_id = (uint8_t)(i + 1);
 
-        /* Skip if already irrigating this zone */
-        if (s_zone_irrigating[i]) continue;
-
-        if (!is_zone_eligible(i)) continue;
+        if (!is_zone_eligible(i)) {
+            /* Safety: stop if data becomes ineligible during irrigation */
+            if (s_zone_irrigating[i]) {
+                ESP_LOGW(TAG, "AUTO: Zone %u ineligible while irrigating -> STOP", zone_id);
+                stop_zone_irrigation(zone_id);
+            }
+            continue;
+        }
 
         const irrigation_zone_t *z = &s_zones[i];
+
+        if (s_zone_irrigating[i]) {
+            /* Sensor-driven: stop when threshold is reached */
+            if (z->sm >= z->threshold) {
+                ESP_LOGI(TAG, "AUTO: Zone %u reached threshold (sm=%u >= th=%u -> STOP)", zone_id, z->sm, z->threshold);
+                stop_zone_irrigation(zone_id);
+            }
+            continue;
+        }
 
         if (z->sm < z->threshold) {
             ESP_LOGI(TAG, "AUTO: Zone %u needs water (sm=%u < th=%u, rainNow=%d -> START)",
                      zone_id, z->sm, z->threshold, weather.rainNow);
-            start_irrigation(zone_id, z->duration);
+            /* 0 = infinite duration; stopped by threshold */
+            start_irrigation(zone_id, 0);
         } else {
             ESP_LOGD(TAG, "AUTO: Zone %u sufficient (sm=%u >= th=%u -> SKIP)",
                      zone_id, z->sm, z->threshold);
@@ -339,26 +409,85 @@ static void run_manual_mode(void)
         return;
     }
 
-    /* Check each zone's command independently — parallel supported */
+    /* Master pump kill from the cloud: pump=false forces every zone closed.
+     * Handled inside the per-zone loop so a per-zone commandId still gets
+     * acknowledged in that case. */
+    bool master_off = !cmd.pump;
+
+    /* Check each zone's command independently — parallel supported. */
     for (int i = 0; i < NUM_ZONES; i++) {
         uint8_t zone_id = (uint8_t)(i + 1);
 
-        if (cmd.zone_valve[i] && cmd.zone_duration[i] > 0) {
-            /* Skip if already irrigating */
-            if (s_zone_irrigating[i]) continue;
+        const char *cid = cmd.zone_command_id[i];
+        bool has_id = (cid[0] != '\0');
+        bool new_id = has_id && (strcmp(cid, s_zone_last_cmd_id[i]) != 0);
 
-            /* Safety: still enforce threshold even in manual mode */
-            if (!is_zone_eligible(i)) continue;
+        bool want_open = master_off ? false : cmd.zone_valve[i];
 
-            if (s_zones[i].sm >= s_zones[i].threshold) {
-                ESP_LOGW(TAG, "MANUAL: Zone %u sm=%u >= th=%u — safety limit, ignoring cmd",
-                         zone_id, s_zones[i].sm, s_zones[i].threshold);
-                continue;
+        esp_err_t send_res    = ESP_OK;   /* result of a start/stop we issued */
+        bool       acted      = false;    /* true if we attempted a valve send */
+        bool       blocked    = false;    /* true if safety refused an open    */
+        const char *block_why = "";
+
+        if (want_open) {
+            /* Command ON ------------------------------------------------ */
+            if (!s_zone_irrigating[i]) {
+                /* Safety: data must be fresh/valid even in manual mode. */
+                if (!is_zone_eligible(i)) {
+                    blocked = true;
+                    block_why = "zone data stale or invalid";
+                } else if (s_zones[i].sm >= s_zones[i].threshold) {
+                    blocked = true;
+                    block_why = "moisture above threshold";
+                    ESP_LOGW(TAG, "MANUAL: Zone %u sm=%u >= th=%u — safety limit, ignoring cmd",
+                             zone_id, s_zones[i].sm, s_zones[i].threshold);
+                } else {
+                    ESP_LOGI(TAG, "MANUAL: Zone %u commanded ON for %u s",
+                             zone_id, cmd.zone_duration[i]);
+                    /* duration 0 => run until cloud sets v=false (threshold still applies). */
+                    send_res = start_irrigation(zone_id, cmd.zone_duration[i]);
+                    acted = true;
+                }
+            }
+            /* else already irrigating — converged, no action needed. */
+        } else {
+            /* Command OFF: proactively close a running zone. */
+            if (s_zone_irrigating[i]) {
+                ESP_LOGI(TAG, "MANUAL: Zone %u commanded OFF — closing valve", zone_id);
+                send_res = stop_zone_irrigation(zone_id);
+                acted = true;
+            }
+            /* else already closed — converged. */
+        }
+
+        /* Acknowledge only genuinely new command ids (de-duplication). */
+        if (new_id) {
+            const char *status;
+            char message[64];
+
+            if (blocked) {
+                status = "failed";
+                snprintf(message, sizeof(message), "rejected: %s", block_why);
+            } else if (acted) {
+                if (send_res == ESP_OK) {
+                    status = "executed";
+                    snprintf(message, sizeof(message), "valve %s",
+                             want_open ? "opened" : "closed");
+                } else {
+                    status = "failed";
+                    snprintf(message, sizeof(message), "ESP-NOW not acked: %s",
+                             esp_err_to_name(send_res));
+                }
+            } else {
+                status = "executed";
+                snprintf(message, sizeof(message), "already %s",
+                         want_open ? "open" : "closed");
             }
 
-            ESP_LOGI(TAG, "MANUAL: Zone %u commanded ON for %u seconds",
-                     zone_id, cmd.zone_duration[i]);
-            start_irrigation(zone_id, cmd.zone_duration[i]);
+            firebase_sync_post_command_ack(i, cid, status, message);
+
+            strncpy(s_zone_last_cmd_id[i], cid, FIREBASE_COMMAND_ID_MAX - 1);
+            s_zone_last_cmd_id[i][FIREBASE_COMMAND_ID_MAX - 1] = '\0';
         }
     }
 }
@@ -406,6 +535,7 @@ void irrigation_engine_init(void)
     memset(s_zone_irrigating, 0, sizeof(s_zone_irrigating));
     memset(s_zone_irr_start, 0, sizeof(s_zone_irr_start));
     memset(s_zone_irr_duration, 0, sizeof(s_zone_irr_duration));
+    memset(s_zone_last_cmd_id, 0, sizeof(s_zone_last_cmd_id));
 
     /* Set default thresholds and durations */
     s_zones[0].threshold = DEFAULT_Z1_THRESHOLD;
@@ -431,6 +561,21 @@ void irrigation_engine_run_cycle(void)
 
     /* 2. Check if any zone's irrigation duration has elapsed */
     check_irrigation_durations();
+
+    /* 2b. Dry-run protection: if the reservoir is confirmed low, stop
+     *     everything and skip irrigation this cycle regardless of mode. */
+    bool dry = !water_available();
+    s_tank_dry = dry;
+    if (dry) {
+        if (any_zone_irrigating() || s_pump_on) {
+            ESP_LOGW(TAG, "SAFETY: reservoir low (%u%%) — stopping all irrigation",
+                     s_water_level_pct);
+            stop_all_irrigation();
+        }
+        pump_off_if_idle();
+        ENGINE_UNLOCK();
+        return;
+    }
 
     /* 3. Run mode-specific logic */
     switch (s_mode) {
@@ -542,6 +687,25 @@ bool irrigation_engine_is_zone_irrigating(uint8_t zone_id)
 bool irrigation_engine_is_pump_on(void)
 {
     return s_pump_on;
+}
+
+void irrigation_engine_set_water_level(uint8_t percent, bool valid)
+{
+    ENGINE_LOCK();
+    if (percent > 100) percent = 100;
+    s_water_level_pct   = percent;
+    s_water_level_valid = valid;
+    ENGINE_UNLOCK();
+}
+
+uint8_t irrigation_engine_get_water_level(void)
+{
+    return s_water_level_pct;
+}
+
+bool irrigation_engine_is_tank_dry(void)
+{
+    return s_tank_dry;
 }
 
 esp_err_t irrigation_engine_get_zone_state(uint8_t zone_id,

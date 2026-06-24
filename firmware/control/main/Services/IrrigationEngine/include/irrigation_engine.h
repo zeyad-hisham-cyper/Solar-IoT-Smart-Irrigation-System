@@ -118,6 +118,24 @@ bool irrigation_engine_is_zone_irrigating(uint8_t zone_id);
 bool irrigation_engine_is_pump_on(void);
 
 /**
+ * @brief Feed the latest reservoir water level to the engine.
+ *
+ * Used for dry-run protection: when @p valid is true and @p percent is below
+ * WATER_LEVEL_DRY_THRESHOLD, the engine refuses to start the pump and stops any
+ * active irrigation.
+ *
+ * @param percent  Reservoir level 0-100 %.
+ * @param valid    true if the reading is from a working, calibrated sensor.
+ */
+void irrigation_engine_set_water_level(uint8_t percent, bool valid);
+
+/** @brief Get the last reported reservoir water level (0-100 %). */
+uint8_t irrigation_engine_get_water_level(void);
+
+/** @brief true if the reservoir is currently considered dry (pump inhibited). */
+bool irrigation_engine_is_tank_dry(void);
+
+/**
  * @brief Get a snapshot of a zone's state (for Firebase upload).
  *
  * @param zone_id  1-based zone ID.

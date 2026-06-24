@@ -30,10 +30,17 @@ extern "C" {
 #define SOIL_NVS_KEY_ADC_DRY      "adc_dry"
 #define SOIL_NVS_KEY_ADC_WET      "adc_wet"
 
+/* Calibration validation */
+#define SOIL_CAL_MIN_ADC_DIFF     200     /**< Min acceptable difference between dry & wet ADC */
+#define SOIL_CAL_NVS_MAGIC_KEY    "cal_ok" /**< NVS key written alongside calibration data      */
+#define SOIL_CAL_NVS_MAGIC_VAL    0xCAU    /**< Expected value — proves calibration is intact    */
+#define SOIL_CAL_ADC_MAX          4095     /**< Maximum plausible 12-bit ADC reading             */
+
 /* Hardware Consts */
 #define CAL_BUTTON_ACTIVE_LEVEL   0
-#define CAL_DEBOUNCE_MS           30
+#define CAL_DEBOUNCE_MS           50       /**< Increased debounce for external button           */
 #define CAL_POLL_MS               10
+#define CAL_LONG_PRESS_MS         3000     /**< Hold >3 s to enter calibration mode              */
 
 #define OUTPUT_HIGH 1
 #define OUTPUT_LOW  0

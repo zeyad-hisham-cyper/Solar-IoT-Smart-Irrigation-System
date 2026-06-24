@@ -54,6 +54,10 @@ typedef struct {
     uint8_t moisture_percentage;      /**< Calculated moisture percentage (0-100) */
     Soil_Moisture_state_t state;      /**< Classified state of the soil */
     uint16_t adc_reading;             /**< Raw ADC reading obtained from sensor */
+    bool     valid;                   /**< true only if the result is calibrated & usable.
+                                           false when the sensor is uncalibrated or the
+                                           calibration is invalid — callers MUST NOT use
+                                           moisture_percentage for control decisions. */
 } Soil_Moisture_Readings_t;
 
 /**
