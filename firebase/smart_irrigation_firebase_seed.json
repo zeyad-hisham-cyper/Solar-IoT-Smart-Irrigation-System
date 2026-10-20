@@ -1,0 +1,94 @@
+{
+  "system": {
+    "mode": "auto",
+    "status": "online",
+    "lastUpdate": 1711111111
+  },
+  "gateway": {
+    "gateway_01": {
+      "pumpStatus": false,
+      "waterLevel": 0,
+      "lastSeen": 1711111111,
+      "status": "offline",
+      "firmwareVersion": "1.0.0"
+    }
+  },
+  "zones": {
+    "zone_01": {
+      "name": "Zone 1",
+      "gatewayId": "gateway_01",
+      "enabled": true,
+      "soilMoisture": 0,
+      "temperature": 0,
+      "flowRate": 0,
+      "valveStatus": false,
+      "lastUpdate": 1711111111,
+      "state": {
+        "irrigating": false,
+        "fault": false
+      }
+    },
+    "zone_02": {
+      "name": "Zone 2",
+      "gatewayId": "gateway_01",
+      "enabled": true,
+      "soilMoisture": 0,
+      "temperature": 0,
+      "flowRate": 0,
+      "valveStatus": false,
+      "lastUpdate": 1711111111,
+      "state": {
+        "irrigating": false,
+        "fault": false
+      }
+    }
+  },
+  "commands": {
+    "gateway_01": {
+      "pump": false,
+      "updatedAt": 1711111111,
+      "zones": {
+        "zone_01": {
+          "openValve": false,
+          "durationSec": 0,
+          "updatedAt": 1711111111
+        },
+        "zone_02": {
+          "openValve": false,
+          "durationSec": 0,
+          "updatedAt": 1711111111
+        }
+      }
+    }
+  },
+  "config": {
+    "global": {
+      "defaultMoistureThreshold": 40,
+      "defaultIrrigationDurationSec": 120,
+      "pollingIntervalSec": 15
+    },
+    "zones": {
+      "zone_01": {
+        "moistureThreshold": 35,
+        "irrigationDurationSec": 120,
+        "priority": 1
+      },
+      "zone_02": {
+        "moistureThreshold": 40,
+        "irrigationDurationSec": 90,
+        "priority": 2
+      }
+    }
+  },
+  "weather": {
+    "current": {
+      "temperature": 0,
+      "rainExpected": false,
+      "condition": "unknown",
+      "updatedAt": 1711111111
+    }
+  },
+  "logs": {
+    "irrigationEvents": {}
+  }
+}

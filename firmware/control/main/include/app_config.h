@@ -9,9 +9,12 @@
 /*                          WIFI CONFIGURATION                                */
 /* ========================================================================== */
 
-/** WiFi Access Point credentials */
-#define WIFI_SSID               "your-wifi-ssid"
-#define WIFI_PASS               "your-wifi-password"
+/** WiFi credentials (WIFI_SSID / WIFI_PASS) come from secrets.h */
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "Missing secrets.h - copy secrets.example.h to secrets.h and fill in your credentials"
+#endif
 
 /* ========================================================================== */
 /*                     PUMP CONFIGURATION (CONTROL BOARD)                     */
@@ -81,8 +84,7 @@
 #define WEATHER_API_LAT         "30.166734786337404"
 #define WEATHER_API_LON         "31.49253916004326"
 
-/** OpenWeather API key */
-#define WEATHER_API_KEY         "your-openweather-api-key"
+/** OpenWeather API key (WEATHER_API_KEY) comes from secrets.h */
 
 /** Full URL format string for the weather endpoint */
 #define WEATHER_API_URL_FMT     "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s"

@@ -1,7 +1,64 @@
 # ============================================================================
-#  Smart Irrigation System — repository .gitignore
-#  Keeps only source, configuration and documentation under version control.
+#  Smart Campus Automation — Graduation Project (MIU)
+#  Only technical work is published: firmware, mobile app, PCB designs,
+#  Firebase data model and technical docs. Everything else stays local.
 # ============================================================================
+
+# ----------------------------------------------------------------------------
+#  Local-only material (thesis, slides, poster, videos, research, rubrics,
+#  3D-printing files, old code copies). Never pushed.
+# ----------------------------------------------------------------------------
+_private/
+
+# ----------------------------------------------------------------------------
+#  Safety net: non-technical file types anywhere in the repo
+# ----------------------------------------------------------------------------
+# Office documents & PDFs (thesis drafts, slides, brochures, papers)
+*.doc
+*.docx
+*.ppt
+*.pptx
+*.pdf
+*.xls
+*.xlsx
+!PCBs/BOM/*.xlsx
+~$*
+
+# Video / audio / editing projects
+*.mp4
+*.mov
+*.MOV
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.m4a
+*.tscproj
+
+# Design-tool sources & stock assets (poster/brochure)
+*.ai
+*.eps
+*.psd
+*.avif
+*.webp
+
+# AI-generated concept images, screenshots, chat images
+ChatGPT Image*
+Gemini_Generated_Image*
+Screenshot*
+WhatsApp Image*
+
+# Archives (sources are already in the repo unpacked)
+*.zip
+*.rar
+*.7z
+
+# Scratch notes
+tasks.md
+firmware/main.md
+firmware/final discussion.md
+*.scratch
+_scratch/
 
 # ----------------------------------------------------------------------------
 #  OS / editor cruft
@@ -12,6 +69,7 @@
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+desktop.ini
 .directory
 *~
 *.swp
@@ -23,6 +81,8 @@ Desktop.ini
 # IDE / tooling
 .idea/
 .vscode/
+!firmware/**/.vscode/
+.claude/
 *.iml
 *.ipr
 *.iws
@@ -32,21 +92,9 @@ Desktop.ini
 compile_commands.json
 
 # ----------------------------------------------------------------------------
-#  Scratch / working notes & generated concept art (not for publication)
-# ----------------------------------------------------------------------------
-tasks.md
-firmware/main.md
-firmware/final discussion.md
-ChatGPT Image*.png
-Gemini_Generated_Image*.png
-*.scratch
-_scratch/
-
-# ----------------------------------------------------------------------------
 #  Firmware — ESP-IDF (firmware/control, firmware/zone, firmware/common)
 # ----------------------------------------------------------------------------
 **/build/
-build/
 managed_components/
 .espressif/
 sdkconfig
@@ -69,23 +117,22 @@ CTestTestfile.cmake
 # ----------------------------------------------------------------------------
 #  Mobile app — Flutter / Dart (app/)
 # ----------------------------------------------------------------------------
-app/.dart_tool/
-app/.flutter-plugins
-app/.flutter-plugins-dependencies
-app/.pub-cache/
-app/.pub/
-app/build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
 app/coverage/
 **/doc/api/
 **/ios/Flutter/.last_build_id
 app.*.symbols
 app.*.map.json
-
-# Flutter platform build artifacts
 app/android/app/debug
 app/android/app/profile
 app/android/app/release
 app/android/.gradle/
+app/android/.kotlin/
+app/android/local.properties
 app/ios/Pods/
 app/ios/.symlinks/
 app/macos/Pods/
@@ -93,27 +140,21 @@ app/windows/flutter/ephemeral/
 app/linux/flutter/ephemeral/
 
 # ----------------------------------------------------------------------------
-#  PCB design — KiCad (PCBs/control, PCBs/Zone)
-#  Keep design sources (.kicad_sch/.kicad_pcb/.kicad_pro), gerbers, BoM CSVs,
-#  footprint libraries and rendered images. Ignore generated/local artifacts.
+#  PCB design — KiCad / Fritzing (PCBs/)
+#  Keep sources (.kicad_sch/.kicad_pcb/.kicad_pro/.fzz), gerbers, BoM and
+#  rendered images. Ignore backups, caches and router temp files.
 # ----------------------------------------------------------------------------
-# KiCad timestamped auto-backup archives
 *-backups/
-# KiCad editor autosave files
 _autosave-*
-# per-user local project state (window position / layout)
 *.kicad_prl
-# generated footprint info cache
 fp-info-cache
-# KiCad lock files
 *.lck
 *.kicad_pcb-bak
 *.kicad_sch-bak
-# ERC / DRC reports
 *-erc.rpt
 *-drc.rpt
-# Heavy 3D mesh/solid models (vendor footprint previews — regenerable, not
-# needed for fabrication). Excluded to keep the repo lean.
+*.dsn
+*.ses
 *.step
 *.stp
 *.wrl
@@ -121,6 +162,7 @@ fp-info-cache
 # ----------------------------------------------------------------------------
 #  Secrets — keep credentials out of version control
 # ----------------------------------------------------------------------------
+.env
 *.env
 .env.*
 google-services.json

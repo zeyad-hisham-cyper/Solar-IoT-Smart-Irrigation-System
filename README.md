@@ -132,7 +132,13 @@ mediated through Firebase Realtime Database.
 │   ├── Zone Schematic.png         # rendered zone schematic
 │   ├── Zone 3D.png                # zone board 3D render
 │   ├── control/                   # GATEWAY KiCad project (.kicad_sch/_pcb/_pro) + BoM csv
-│   └── Zone/                      # ZONE KiCad project + gerbers/ + final_gerber/ + lib/
+│   ├── Zone/                      # ZONE KiCad project + gerbers/ + final_gerber/ + lib/
+│   ├── light/                     # SMART LIGHTING relay board KiCad project + BoM csv
+│   ├── gerbers/                   # fabrication outputs (control, zones, light)
+│   ├── fritzing/                  # early breadboard prototypes (.fzz) + wiring images
+│   └── BOM/                       # proof-of-concept bill of materials (.xlsx)
+│
+├── firebase/                      # Firebase RTDB data model (db.md), seed data, sample export
 │
 ├── firmware/                      # ESP-IDF firmware (two apps + shared components)
 │   ├── db.json                    # authoritative Firebase RTDB schema export
@@ -248,7 +254,8 @@ water-level sensor, power).
 
 ### 3.4 PCB Design (KiCad)
 
-Both boards are custom two-layer PCBs designed in **KiCad 8**. The full design sources live in
+The gateway and zone boards are custom two-layer PCBs designed in **KiCad 8**; a third board
+drives the campus **smart-lighting** relays. The full design sources live in
 [`PCBs/`](PCBs/) — schematics, layouts, fabrication gerbers and the bill-of-materials CSVs are
 all version-controlled, so each board can be reviewed, edited and re-fabricated from this repo.
 
@@ -256,6 +263,25 @@ all version-controlled, so each board can be reviewed, edited and re-fabricated 
 |-------|---------------|---------------------|-----|
 | **Gateway / Control** | [`PCBs/control/control.kicad_pro`](PCBs/control/control.kicad_pro) | — | [`control.csv`](PCBs/control/control.csv) |
 | **Zone** | [`PCBs/Zone/Zone.kicad_pro`](PCBs/Zone/Zone.kicad_pro) | [`gerber/`](PCBs/Zone/gerber/), [`final_gerber/`](PCBs/Zone/final_gerber/) | [`Zone.csv`](PCBs/Zone/Zone.csv) |
+| **Smart Lighting** | [`PCBs/light/light.kicad_pro`](PCBs/light/light.kicad_pro) | [`gerbers/light/`](PCBs/gerbers/light/) | [`light.csv`](PCBs/light/light.csv) |
+
+Fabrication-ready gerber + drill sets for every board are also collected in
+[`PCBs/gerbers/`](PCBs/gerbers/) (`control/`, `zones/`, `Zones Single/`, `light/`). Early
+breadboard prototypes made in **Fritzing** (`.fzz` + wiring images) are in
+[`PCBs/fritzing/`](PCBs/fritzing/), and the proof-of-concept bill of materials is in
+[`PCBs/BOM/`](PCBs/BOM/).
+
+#### Smart Lighting board
+
+A 12 V relay controller for campus lighting, built around a **NodeMCU (ESP-12E)**:
+
+| Block | Parts |
+|-------|-------|
+| MCU | NodeMCU 1.0 (ESP-12E) on two 15-pin headers |
+| Power | 12 V input → **LM2596** buck module → 5 V / 3.3 V rails, bulk + decoupling capacitors |
+| Load switching | 4 × **SRD-12VDC-SL-C** relays, each isolated by a **PC817** optocoupler and driven by a **2N2222** transistor with a **1N4007** flyback diode (hierarchical sheet [`realy_module.kicad_sch`](PCBs/light/realy_module.kicad_sch)) |
+| Indicators | 2 × **74HC595** shift registers driving 16 status LEDs |
+| I/O | 5 × 2-pin screw terminals for supply and lamp outputs, TL2285EE push-button |
 
 The zone project bundles its custom symbol/footprint library and the third-party YAAJ **LM2596**
 buck-converter footprint under [`PCBs/Zone/lib/`](PCBs/Zone/lib/). Open a board with
@@ -675,6 +701,7 @@ Prerequisites: ESP-IDF v5.x installed and exported (`. $IDF_PATH/export.sh`), ta
 ```bash
 # Gateway / control board
 cd firmware/control
+cp main/include/secrets.example.h main/include/secrets.h   # first time only: add your credentials
 idf.py set-target esp32
 idf.py build
 idf.py -p <PORT> flash monitor       # PORT e.g. COM5 (Windows) or /dev/ttyUSB0 (Linux)
@@ -718,20 +745,27 @@ flutter run
 
 | What | Where |
 |------|-------|
-| Wi-Fi SSID / password | `firmware/control/main/include/app_config.h` → `WIFI_SSID`, `WIFI_PASS` |
+| Wi-Fi SSID / password | `firmware/control/main/include/secrets.h` → `WIFI_SSID`, `WIFI_PASS` |
+| OpenWeather API key | `secrets.h` → `WEATHER_API_KEY` |
 | Pump pin / polarity | `control/.../app_config.h` → `PUMP_RELAY_GPIO`, `PUMP_ACTIVE_HIGH` |
 | Water-level calibration | `WATER_LEVEL_RAW_EMPTY/FULL`, `WATER_LEVEL_DRY_THRESHOLD` |
 | Status LED / buzzer pins | both `app_config.h` files |
 | Default thresholds & durations | `DEFAULT_Z*_THRESHOLD`, `DEFAULT_Z*_DURATION` (overridable from Firebase) |
-| Firebase keys / DB URL / IDs | `firmware/control/main/include/firebase_config.h` |
+| Firebase API key / login / DB URL | `secrets.h` → `FIREBASE_API_KEY`, `FIREBASE_AUTH_EMAIL`, `FIREBASE_AUTH_PASSWORD`, `FIREBASE_DB_URL` |
+| Firebase IDs & timing | `firmware/control/main/include/firebase_config.h` |
 | ESP-NOW channel (zone hint) | `firmware/zone/main/include/app_config.h` → `ESP_NOW_CHANNEL` |
 | App Firebase config | `app/lib/firebase_options.dart` (generated) |
 | App RTDB paths & zone IDs | `app/lib/core/constants/firebase_paths.dart` |
 
-> **Secrets:** Wi-Fi and Firebase credentials live in source for development convenience. The
-> repository `.gitignore` already excludes `secrets.h`, `*.env`, `google-services.json` and
-> `GoogleService-Info.plist`. For production, move Wi-Fi/Firebase secrets to NVS or a build-time
-> secrets file and out of version control.
+> **Secrets:** all credentials live in `firmware/control/main/include/secrets.h`, which is
+> git-ignored. Before building the gateway, copy the template and fill in your own values:
+>
+> ```bash
+> cp firmware/control/main/include/secrets.example.h firmware/control/main/include/secrets.h
+> ```
+>
+> The build stops with a clear `#error` if `secrets.h` is missing. The `.gitignore` also excludes
+> `*.env`, `google-services.json` and `GoogleService-Info.plist`.
 
 ---
 

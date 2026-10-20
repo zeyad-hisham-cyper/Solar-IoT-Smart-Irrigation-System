@@ -16,15 +16,16 @@ extern "C" {
 /*                        FIREBASE AUTHENTICATION                             */
 /* ========================================================================== */
 
-/** Firebase Web API Key (from Firebase Console → Project Settings) */
-#define FIREBASE_API_KEY            "your-firebase-web-api-key"
+/** FIREBASE_API_KEY, FIREBASE_AUTH_EMAIL, FIREBASE_AUTH_PASSWORD and
+ *  FIREBASE_DB_URL come from secrets.h (template: secrets.example.h). */
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "Missing secrets.h - copy secrets.example.h to secrets.h and fill in your credentials"
+#endif
 
 /** Firebase Identity Toolkit sign-in endpoint */
 #define FIREBASE_AUTH_URL           "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" FIREBASE_API_KEY
-
-/** Login credentials */
-#define FIREBASE_AUTH_EMAIL         "device@example.com"
-#define FIREBASE_AUTH_PASSWORD      "your-device-password"
 
 /** Maximum lengths for token storage */
 #define FIREBASE_ID_TOKEN_MAX_LEN   1200
@@ -34,8 +35,7 @@ extern "C" {
 /*                        FIREBASE REALTIME DATABASE                          */
 /* ========================================================================== */
 
-/** Base URL of the Realtime Database (no trailing slash) */
-#define FIREBASE_DB_URL             "https://smart-irrigation-system-e415d-default-rtdb.europe-west1.firebasedatabase.app"
+/** Base URL of the Realtime Database (FIREBASE_DB_URL, no trailing slash) comes from secrets.h */
 
 /* ========================================================================== */
 /*                             SYSTEM IDS                                     */

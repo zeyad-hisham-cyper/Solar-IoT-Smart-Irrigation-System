@@ -1,0 +1,197 @@
+{
+  "system": {
+    "project": {
+      "name": "Smart Irrigation System",
+      "version": "1.0.0",
+      "environment": "production"
+    },
+    "mode": "auto",
+    "status": "online",
+    "lastUpdate": 1711111111
+  },
+  "gateways": {
+    "gateway_01": {
+      "name": "Main Gateway",
+      "location": "Field A",
+      "status": "offline",
+      "lastSeen": 1711111111,
+      "firmwareVersion": "1.0.0",
+      "network": {
+        "ip": "",
+        "rssi": 0
+      },
+      "pump": {
+        "enabled": true,
+        "status": false,
+        "fault": false,
+        "lastChangedAt": 1711111111
+      },
+      "tank": {
+        "waterLevelPercent": 0,
+        "lastUpdate": 1711111111
+      },
+      "stats": {
+        "zonesCount": 2
+      }
+    }
+  },
+  "zones": {
+    "zone_01": {
+      "name": "Zone 1",
+      "gatewayId": "gateway_01",
+      "location": "Tomato Area",
+      "cropType": "Tomato",
+      "enabled": true,
+      "priority": 1,
+      "lastUpdate": 1711111111,
+      "sensors": {
+        "soilMoisture": {
+          "value": 0,
+          "unit": "%",
+          "lastUpdate": 1711111111
+        },
+        "temperature": {
+          "value": 0,
+          "unit": "C",
+          "lastUpdate": 1711111111
+        },
+        "flowRate": {
+          "value": 0,
+          "unit": "L/min",
+          "lastUpdate": 1711111111
+        }
+      },
+      "actuators": {
+        "valve": {
+          "status": false,
+          "fault": false,
+          "lastChangedAt": 1711111111
+        }
+      },
+      "state": {
+        "irrigating": false,
+        "health": "normal",
+        "fault": false
+      },
+      "config": {
+        "mode": "auto",
+        "moistureThreshold": 35,
+        "irrigationDurationSec": 120,
+        "maxDailyWaterLiters": 100,
+        "allowWeatherOverride": true
+      }
+    },
+    "zone_02": {
+      "name": "Zone 2",
+      "gatewayId": "gateway_01",
+      "location": "Cucumber Area",
+      "cropType": "Cucumber",
+      "enabled": true,
+      "priority": 2,
+      "lastUpdate": 1711111111,
+      "sensors": {
+        "soilMoisture": {
+          "value": 0,
+          "unit": "%",
+          "lastUpdate": 1711111111
+        },
+        "temperature": {
+          "value": 0,
+          "unit": "C",
+          "lastUpdate": 1711111111
+        },
+        "flowRate": {
+          "value": 0,
+          "unit": "L/min",
+          "lastUpdate": 1711111111
+        }
+      },
+      "actuators": {
+        "valve": {
+          "status": false,
+          "fault": false,
+          "lastChangedAt": 1711111111
+        }
+      },
+      "state": {
+        "irrigating": false,
+        "health": "normal",
+        "fault": false
+      },
+      "config": {
+        "mode": "auto",
+        "moistureThreshold": 40,
+        "irrigationDurationSec": 90,
+        "maxDailyWaterLiters": 100,
+        "allowWeatherOverride": true
+      }
+    }
+  },
+  "commands": {
+    "gateway_01": {
+      "pump": {
+        "targetState": false,
+        "source": "cloud",
+        "reason": "initial_state",
+        "updatedAt": 1711111111
+      },
+      "zones": {
+        "zone_01": {
+          "openValve": false,
+          "durationSec": 0,
+          "source": "cloud",
+          "reason": "initial_state",
+          "updatedAt": 1711111111
+        },
+        "zone_02": {
+          "openValve": false,
+          "durationSec": 0,
+          "source": "cloud",
+          "reason": "initial_state",
+          "updatedAt": 1711111111
+        }
+      }
+    }
+  },
+  "config": {
+    "global": {
+      "systemMode": "auto",
+      "defaultMoistureThreshold": 40,
+      "defaultIrrigationDurationSec": 120,
+      "pollingIntervalSec": 15,
+      "weatherCheckIntervalMin": 30,
+      "commandTimeoutSec": 60,
+      "maxSimultaneousZones": 1
+    }
+  },
+  "weather": {
+    "current": {
+      "temperature": 0,
+      "humidity": 0,
+      "condition": "unknown",
+      "rainExpected": false,
+      "rainMm": 0,
+      "windSpeed": 0,
+      "updatedAt": 1711111111
+    },
+    "forecast": {
+      "next6hRainExpected": false,
+      "next12hRainExpected": false,
+      "updatedAt": 1711111111
+    }
+  },
+  "logs": {
+    "irrigationEvents": {},
+    "faultEvents": {},
+    "systemEvents": {}
+  },
+  "analytics": {
+    "daily": {
+      "2026-04-08": {
+        "totalWaterUsedLiters": 0,
+        "totalIrrigationDurationSec": 0,
+        "zonesIrrigated": 0
+      }
+    }
+  }
+}
