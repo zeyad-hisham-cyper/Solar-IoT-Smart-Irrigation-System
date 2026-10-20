@@ -25,6 +25,22 @@ field and a phone in your hand. It is built from **three cooperating subsystems*
 
 ---
 
+## Team
+
+Graduation project — **Electronics and Communications Department**, Faculty of Engineering
+Sciences and Arts, **Misr International University (MIU)**, Cairo, 2026.
+
+| Member |
+|--------|
+| Zeyad Hisham |
+| Abdelrahman Adel |
+| Amr Yasser |
+| Ahmed Mohamed Saad |
+
+**Supervisor:** Dr. Ibrahiem Abdalla
+
+---
+
 ## Table of Contents
 
 - [1. System Architecture](#1-system-architecture)
